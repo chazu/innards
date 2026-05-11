@@ -202,3 +202,7 @@ cargo check --bins
 cargo test --lib
 cargo build --bins
 ```
+
+## License
+
+`navsplat` is licensed under GPL-3.0-only. See `LICENSE`.
