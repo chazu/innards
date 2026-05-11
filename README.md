@@ -41,7 +41,7 @@ cargo install --path .
 Install directly from git:
 
 ```sh
-cargo install --git https://github.com/USER/navsplat.git
+cargo install --git https://github.com/rdaum/innards.git
 ```
 
 `cargo install` places the binaries in Cargo's bin directory, usually
