@@ -1,14 +1,14 @@
 use std::env;
 use std::fs;
 use std::io::{self, Stdout, Write};
+use std::ops::Range;
 use std::path::PathBuf;
-use std::process;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use crossterm::ExecutableCommand;
 use crossterm::cursor::MoveTo;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position};
@@ -37,11 +37,7 @@ fn main() -> Result<()> {
     drop(terminal);
 
     match outcome {
-        Outcome::Saved => {
-            app.save()?;
-            Ok(())
-        }
-        Outcome::Cancelled => process::exit(1),
+        Outcome::Quit => Ok(()),
     }
 }
 
@@ -104,8 +100,7 @@ fn parse_line_number(value: &str) -> Result<usize> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Outcome {
-    Saved,
-    Cancelled,
+    Quit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,6 +114,12 @@ struct SearchState {
     direction: SearchDirection,
     origin_line: usize,
     origin_col: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BufferPoint {
+    line: usize,
+    col: usize,
 }
 
 struct Editor {
@@ -136,6 +137,7 @@ struct Editor {
     last_drawn_height: u16,
     last_drawn_top: u16,
     search: Option<SearchState>,
+    mark: Option<BufferPoint>,
 }
 
 impl Editor {
@@ -170,6 +172,7 @@ impl Editor {
             last_drawn_height: height.max(MIN_HEIGHT),
             last_drawn_top: 0,
             search: None,
+            mark: None,
         })
     }
 
@@ -196,6 +199,52 @@ impl Editor {
         line_start_char(&self.buffer, self.cursor_line) + self.cursor_col
     }
 
+    fn cursor_point(&self) -> BufferPoint {
+        BufferPoint {
+            line: self.cursor_line,
+            col: self.cursor_col,
+        }
+    }
+
+    fn point_char_idx(&self, point: BufferPoint) -> usize {
+        let line = point.line.min(self.line_count().saturating_sub(1));
+        line_start_char(&self.buffer, line) + point.col.min(line_len_chars(&self.buffer, line))
+    }
+
+    fn set_cursor_from_char_idx(&mut self, char_idx: usize) {
+        let char_idx = char_idx.min(self.buffer.len_chars());
+        self.cursor_line = self.buffer.char_to_line(char_idx);
+        self.cursor_col = char_idx.saturating_sub(line_start_char(&self.buffer, self.cursor_line));
+        self.clamp_cursor();
+    }
+
+    fn active_region(&self) -> Option<Range<usize>> {
+        let mark = self.mark?;
+        let mark = self.point_char_idx(mark);
+        let cursor = self.cursor_char_idx();
+        if mark == cursor {
+            return None;
+        }
+        Some(mark.min(cursor)..mark.max(cursor))
+    }
+
+    fn delete_active_region(&mut self) -> bool {
+        let Some(region) = self.active_region() else {
+            return false;
+        };
+        self.remove_region(region);
+        self.mark_dirty();
+        true
+    }
+
+    fn remove_region(&mut self, region: Range<usize>) -> String {
+        let start = region.start;
+        let text = self.buffer.slice(region.clone()).to_string();
+        self.buffer.remove(region);
+        self.set_cursor_from_char_idx(start);
+        text
+    }
+
     fn clamp_cursor(&mut self) {
         self.cursor_line = self.cursor_line.min(self.line_count().saturating_sub(1));
         self.cursor_col = self.cursor_col.min(self.line_len());
@@ -218,12 +267,14 @@ impl Editor {
     }
 
     fn insert_char(&mut self, ch: char) {
+        self.delete_active_region();
         self.buffer.insert_char(self.cursor_char_idx(), ch);
         self.cursor_col += 1;
         self.mark_dirty();
     }
 
     fn insert_newline(&mut self) {
+        self.delete_active_region();
         self.buffer.insert_char(self.cursor_char_idx(), '\n');
         self.cursor_line += 1;
         self.cursor_col = 0;
@@ -231,6 +282,9 @@ impl Editor {
     }
 
     fn backspace(&mut self) {
+        if self.delete_active_region() {
+            return;
+        }
         if self.cursor_col > 0 {
             let end = self.cursor_char_idx();
             self.buffer.remove(end - 1..end);
@@ -248,6 +302,9 @@ impl Editor {
     }
 
     fn delete_char(&mut self) {
+        if self.delete_active_region() {
+            return;
+        }
         if self.cursor_col < self.line_len() {
             let start = self.cursor_char_idx();
             self.buffer.remove(start..start + 1);
@@ -278,10 +335,52 @@ impl Editor {
         self.mark_dirty();
     }
 
+    fn toggle_mark(&mut self) {
+        let point = self.cursor_point();
+        if self.mark == Some(point) {
+            self.mark = None;
+            self.status = "mark cleared".to_string();
+        } else {
+            self.mark = Some(point);
+            self.status = "mark set".to_string();
+        }
+        self.ctrl_x_pending = false;
+    }
+
+    fn cancel_mark(&mut self) {
+        if self.mark.take().is_some() {
+            self.status = "mark cancelled".to_string();
+        } else {
+            self.status = "quit".to_string();
+        }
+        self.ctrl_x_pending = false;
+    }
+
+    fn copy_region(&mut self) {
+        let Some(region) = self.active_region() else {
+            self.status = "no active region".to_string();
+            return;
+        };
+        self.kill_ring = self.buffer.slice(region).to_string();
+        self.status = "region copied".to_string();
+        self.ctrl_x_pending = false;
+    }
+
+    fn kill_region(&mut self) {
+        let Some(region) = self.active_region() else {
+            self.status = "no active region".to_string();
+            return;
+        };
+        self.kill_ring = self.remove_region(region);
+        self.mark_dirty();
+        self.status = "region killed".to_string();
+    }
+
     fn yank(&mut self) {
         if self.kill_ring.is_empty() {
             return;
         }
+        self.delete_active_region();
         let text = self.kill_ring.clone();
         for ch in text.chars() {
             if ch == '\n' {
@@ -537,6 +636,7 @@ impl Editor {
         self.dirty = true;
         self.ctrl_x_pending = false;
         self.search = None;
+        self.mark = None;
         self.status = "modified".to_string();
     }
 }
@@ -584,11 +684,20 @@ fn run_editor(
     syntax: &SyntaxHighlighter,
 ) -> Result<Outcome> {
     loop {
-        if event::poll(Duration::from_millis(80))?
-            && let Event::Key(key) = event::read()?
-            && let Some(outcome) = handle_key(app, key, terminal)?
-        {
-            return Ok(outcome);
+        if event::poll(Duration::from_millis(80))? {
+            match event::read() {
+                Ok(Event::Key(key))
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    if let Some(outcome) = handle_key(app, key, terminal)? {
+                        return Ok(outcome);
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    app.status = format!("input error: {err}");
+                }
+            }
         }
         terminal.terminal.draw(|frame| draw(frame, app, syntax))?;
     }
@@ -608,10 +717,6 @@ fn handle_key(
     }
 
     match key.code {
-        KeyCode::Esc => return Ok(Some(Outcome::Cancelled)),
-        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            return Ok(Some(Outcome::Cancelled));
-        }
         KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.ctrl_x_pending = true;
             app.status = "Ctrl-X ...".to_string();
@@ -622,18 +727,27 @@ fn handle_key(
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.begin_search(SearchDirection::Reverse);
         }
+        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_mark(),
+        KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => app.toggle_mark(),
+        KeyCode::Null
+            if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.toggle_mark();
+        }
         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cursor_col = 0,
         KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.cursor_col = app.line_len();
         }
         KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => app.move_word_left(),
         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => app.move_word_right(),
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => app.copy_region(),
         KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_left(),
         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_right(),
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_up(),
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_down(),
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => app.delete_char(),
         KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => app.kill_to_eol(),
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => app.kill_region(),
         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => app.yank(),
         KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => app.page_up(),
         KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => app.page_down(),
@@ -674,7 +788,7 @@ fn handle_ctrl_x_chord(app: &mut Editor, key: KeyEvent) -> Result<Option<Outcome
     app.ctrl_x_pending = false;
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Ok(Some(Outcome::Saved))
+            Ok(Some(Outcome::Quit))
         }
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.save()?;
@@ -791,9 +905,11 @@ fn render_lines(
     let mut highlighter = HighlightLines::new(syntax.syntax(), &syntax.theme);
     let end = (app.scroll_y + text_height).min(app.line_count());
     let mut output = Vec::with_capacity(text_height);
+    let active_region = app.active_region();
 
     for idx in app.scroll_y..end {
         let line = line_text(&app.buffer, idx);
+        let line_region = line_selection_range(app, idx, active_region.as_ref());
         let highlighted = highlighter
             .highlight_line(&line, &syntax.syntax_set)
             .unwrap_or_else(|_| vec![(syntect::highlighting::Style::default(), line.as_str())]);
@@ -805,6 +921,7 @@ fn render_lines(
             highlighted,
             app.scroll_x,
             text_width,
+            line_region,
         ));
         output.push(Line::from(spans));
     }
@@ -817,6 +934,23 @@ fn render_lines(
     }
 
     output
+}
+
+fn line_selection_range(
+    app: &Editor,
+    line: usize,
+    active_region: Option<&Range<usize>>,
+) -> Option<Range<usize>> {
+    let active_region = active_region?;
+    let line_start = line_start_char(&app.buffer, line);
+    let line_end = line_start + line_len_chars(&app.buffer, line);
+    let start = active_region.start.max(line_start);
+    let end = active_region.end.min(line_end);
+    if start < end {
+        Some(start - line_start..end - line_start)
+    } else {
+        None
+    }
 }
 
 fn buffer_line_count(buffer: &Rope) -> usize {
@@ -863,21 +997,27 @@ fn slice_highlighted_line(
     highlighted: Vec<(syntect::highlighting::Style, &str)>,
     start: usize,
     width: usize,
+    selection: Option<Range<usize>>,
 ) -> Vec<Span<'static>> {
     let end = start.saturating_add(width);
     let mut spans = Vec::new();
     let mut pos = 0usize;
 
     for (style, text) in highlighted {
-        let mut buf = String::new();
+        let base_style = syntect_style(style);
         for ch in text.chars() {
             if pos >= start && pos < end {
-                buf.push(ch);
+                let style = if selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.contains(&pos))
+                {
+                    base_style.bg(Color::DarkGray)
+                } else {
+                    base_style
+                };
+                spans.push(Span::styled(ch.to_string(), style));
             }
             pos += 1;
-        }
-        if !buf.is_empty() {
-            spans.push(Span::styled(buf, syntect_style(style)));
         }
         if pos >= end {
             break;
@@ -956,6 +1096,7 @@ mod tests {
             last_drawn_height: DEFAULT_HEIGHT,
             last_drawn_top: 0,
             search: None,
+            mark: None,
         }
     }
 
@@ -990,6 +1131,85 @@ mod tests {
 
         assert_eq!(editor.buffer.to_string(), "abcdef");
         assert_eq!(editor.kill_ring, "\n");
+    }
+
+    #[test]
+    fn ctrl_w_kills_active_region() {
+        let mut editor = editor_with("abc def");
+        editor.cursor_col = 1;
+        editor.toggle_mark();
+        editor.cursor_col = 5;
+
+        editor.kill_region();
+
+        assert_eq!(editor.buffer.to_string(), "aef");
+        assert_eq!(editor.kill_ring, "bc d");
+        assert_eq!((editor.cursor_line, editor.cursor_col), (0, 1));
+        assert_eq!(editor.mark, None);
+    }
+
+    #[test]
+    fn alt_w_copies_active_region_without_deleting() {
+        let mut editor = editor_with("abc def");
+        editor.cursor_col = 1;
+        editor.toggle_mark();
+        editor.cursor_col = 5;
+
+        editor.copy_region();
+
+        assert_eq!(editor.buffer.to_string(), "abc def");
+        assert_eq!(editor.kill_ring, "bc d");
+        assert!(editor.mark.is_some());
+    }
+
+    #[test]
+    fn yank_replaces_active_region() {
+        let mut editor = editor_with("abc def");
+        editor.kill_ring = "XYZ".to_string();
+        editor.cursor_col = 1;
+        editor.toggle_mark();
+        editor.cursor_col = 5;
+
+        editor.yank();
+
+        assert_eq!(editor.buffer.to_string(), "aXYZef");
+        assert_eq!((editor.cursor_line, editor.cursor_col), (0, 4));
+        assert_eq!(editor.mark, None);
+    }
+
+    #[test]
+    fn down_arrow_after_mark_does_not_exit() {
+        let mut editor = editor_with("abc\ndef");
+        editor.toggle_mark();
+        editor.move_down();
+
+        assert_eq!((editor.cursor_line, editor.cursor_col), (1, 0));
+        assert!(editor.active_region().is_some());
+    }
+
+    #[test]
+    fn ctrl_g_cancels_active_mark() {
+        let mut editor = editor_with("abc\ndef");
+        editor.toggle_mark();
+        editor.move_down();
+
+        editor.cancel_mark();
+
+        assert_eq!(editor.mark, None);
+        assert!(editor.active_region().is_none());
+        assert_eq!(editor.status, "mark cancelled");
+    }
+
+    #[test]
+    fn selection_range_after_region_does_not_underflow() {
+        let mut editor = editor_with("abc\ndef\nghi");
+        editor.toggle_mark();
+        editor.move_down();
+
+        assert_eq!(
+            line_selection_range(&editor, 2, editor.active_region().as_ref()),
+            None
+        );
     }
 
     #[test]
@@ -1031,10 +1251,27 @@ mod tests {
         let exit = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(
             handle_ctrl_x_chord(&mut editor, exit).unwrap(),
-            Some(Outcome::Saved)
+            Some(Outcome::Quit)
         );
         assert!(!editor.ctrl_x_pending);
         assert!(editor.search.is_some());
+    }
+
+    #[test]
+    fn ctrl_g_cancels_incremental_search() {
+        let mut editor = editor_with("abc foo");
+        editor.cursor_col = 2;
+        editor.begin_search(SearchDirection::Forward);
+        for ch in "foo".chars() {
+            editor.search_insert_char(ch);
+        }
+        assert_eq!((editor.cursor_line, editor.cursor_col), (0, 4));
+
+        let cancel = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(handle_search_key(&mut editor, cancel).unwrap(), None);
+
+        assert!(editor.search.is_none());
+        assert_eq!((editor.cursor_line, editor.cursor_col), (0, 2));
     }
 
     #[test]
