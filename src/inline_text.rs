@@ -20,6 +20,7 @@ mod render;
 
 const DEFAULT_HEIGHT: u16 = 16;
 const MIN_HEIGHT: u16 = 5;
+const DEFAULT_FILL_COLUMN: usize = 80;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -492,6 +493,79 @@ impl Editor {
         self.mark_dirty();
     }
 
+    fn fill_paragraph(&mut self, column: usize) {
+        let Some((start_line, end_line)) = self.paragraph_bounds(self.cursor_line) else {
+            self.status = "no paragraph".to_string();
+            return;
+        };
+
+        let original_cursor = self.cursor_char_idx();
+        let start = line_start_char(&self.buffer, start_line);
+        let last_line = end_line - 1;
+        let end =
+            line_start_char(&self.buffer, last_line) + line_len_chars(&self.buffer, last_line);
+        let original = self.buffer.slice(start..end).to_string();
+        let lines: Vec<String> = (start_line..end_line)
+            .map(|line| line_text(&self.buffer, line))
+            .collect();
+
+        let indent_len = common_indent_len(&lines);
+        let indent: String = lines
+            .iter()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.chars().take(indent_len).collect())
+            .unwrap_or_default();
+        let mut words = Vec::new();
+        for line in &lines {
+            let content: String = line.chars().skip(indent_len).collect();
+            words.extend(content.split_whitespace().map(str::to_string));
+        }
+
+        if words.is_empty() {
+            self.status = "no paragraph".to_string();
+            return;
+        }
+
+        let wrapped = wrap_words(&words, &indent, column);
+        if wrapped == original {
+            self.status = format!("already filled to {column}");
+            return;
+        }
+
+        self.record_edit();
+        self.buffer.remove(start..end);
+        self.buffer.insert(start, &wrapped);
+        let cursor = start
+            + original_cursor
+                .saturating_sub(start)
+                .min(char_len(&wrapped));
+        self.set_cursor_from_char_idx(cursor);
+        self.mark_dirty();
+        self.status = format!("filled paragraph to {column}");
+    }
+
+    fn paragraph_bounds(&self, line: usize) -> Option<(usize, usize)> {
+        if self.line_is_blank(line) {
+            return None;
+        }
+
+        let mut start = line;
+        while start > 0 && !self.line_is_blank(start - 1) {
+            start -= 1;
+        }
+
+        let mut end = line + 1;
+        while end < self.line_count() && !self.line_is_blank(end) {
+            end += 1;
+        }
+
+        Some((start, end))
+    }
+
+    fn line_is_blank(&self, line: usize) -> bool {
+        line_text(&self.buffer, line).trim().is_empty()
+    }
+
     fn move_left(&mut self) {
         if self.cursor_col > 0 {
             self.cursor_col -= 1;
@@ -866,6 +940,9 @@ fn handle_key(
         }
         KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => app.move_word_left(),
         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => app.move_word_right(),
+        KeyCode::Char('q') if mode.is_editable() && key.modifiers.contains(KeyModifiers::ALT) => {
+            app.fill_paragraph(DEFAULT_FILL_COLUMN)
+        }
         KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => app.copy_region(),
         KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_left(),
         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_right(),
@@ -1068,6 +1145,46 @@ fn resize_anchor_row(
     anchor.min(terminal_rows.saturating_sub(1))
 }
 
+fn common_indent_len(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.chars().take_while(|ch| ch.is_whitespace()).count())
+        .min()
+        .unwrap_or(0)
+}
+
+fn wrap_words(words: &[String], indent: &str, column: usize) -> String {
+    let indent_len = char_len(indent);
+    let target = column.max(indent_len + 1);
+    let mut lines = Vec::new();
+    let mut current = indent.to_string();
+    let mut current_len = indent_len;
+
+    for word in words {
+        let word_len = char_len(word);
+        let needs_space = current_len > indent_len;
+        let next_len = current_len + usize::from(needs_space) + word_len;
+
+        if needs_space && next_len > target {
+            lines.push(current);
+            current = indent.to_string();
+            current.push_str(word);
+            current_len = indent_len + word_len;
+        } else {
+            if needs_space {
+                current.push(' ');
+                current_len += 1;
+            }
+            current.push_str(word);
+            current_len += word_len;
+        }
+    }
+
+    lines.push(current);
+    lines.join("\n")
+}
+
 fn char_len(text: &str) -> usize {
     text.chars().count()
 }
@@ -1226,6 +1343,45 @@ mod tests {
         editor.undo();
         assert_eq!(editor.buffer.to_string(), "abef");
         assert_eq!((editor.cursor_line, editor.cursor_col), (0, 2));
+    }
+
+    #[test]
+    fn fill_paragraph_wraps_current_paragraph() {
+        let mut editor = editor_with(
+            "before\n\none two three four five six seven eight nine ten eleven twelve\ncontinued here\n\nafter",
+        );
+        editor.cursor_line = 2;
+
+        editor.fill_paragraph(24);
+
+        assert_eq!(
+            editor.buffer.to_string(),
+            "before\n\none two three four five\nsix seven eight nine ten\neleven twelve continued\nhere\n\nafter"
+        );
+        assert_eq!(editor.status, "filled paragraph to 24");
+    }
+
+    #[test]
+    fn fill_paragraph_preserves_common_indent() {
+        let mut editor = editor_with("    alpha beta gamma delta epsilon\n    zeta eta theta");
+
+        editor.fill_paragraph(22);
+
+        assert_eq!(
+            editor.buffer.to_string(),
+            "    alpha beta gamma\n    delta epsilon zeta\n    eta theta"
+        );
+    }
+
+    #[test]
+    fn fill_paragraph_is_one_undo_step() {
+        let mut editor = editor_with("one two three four five");
+
+        editor.fill_paragraph(12);
+        assert_eq!(editor.buffer.to_string(), "one two\nthree four\nfive");
+
+        editor.undo();
+        assert_eq!(editor.buffer.to_string(), "one two three four five");
     }
 
     #[test]
