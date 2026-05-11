@@ -1,0 +1,204 @@
+# innards
+
+Small inline terminal tools for jumping around source code and editing files without
+clearing the shell above them.
+
+On account of agents I spend most of my time in a terminal window these days,
+and often also remote over SSH, and I missed some of the conveniences of an IDE
+but wanted something quick and nimble that didn't break flow.
+
+These little utilities let you drop in and out of navigation and editing and
+viewing files but what you were working on visible.
+
+Quick, and get out of your way.
+
+## Binaries
+
+- `navsplat`: rust-analyzer-backed Rust workspace symbol picker.
+- `inmacs`: inline editor with Emacs-like navigation and editing keys.
+- `inpage`: read-only inline pager with the same movement/search surface as
+  `inmacs`.
+
+All three use ratatui with an inline terminal viewport, so they open below the
+current prompt instead of taking over the whole screen.
+
+## Build
+
+```sh
+cargo build --release --bins
+```
+
+The binaries will be under `target/release/`.
+
+## Install
+
+Install from a local checkout:
+
+```sh
+cargo install --path .
+```
+
+Install directly from git:
+
+```sh
+cargo install --git https://github.com/USER/navsplat.git
+```
+
+`cargo install` places the binaries in Cargo's bin directory, usually
+`~/.cargo/bin`. Make sure that directory is on `PATH`.
+
+## Requirements
+
+`navsplat` starts `rust-analyzer` and talks to it over LSP, so `rust-analyzer`
+must be on `PATH`.
+
+`navsplat` opens selections with `$VISUAL`, then `$EDITOR`, then `vi` if neither
+environment variable is set. It invokes the editor as:
+
+```sh
+$EDITOR +LINE FILE
+```
+
+Clipboard copy tries `wl-copy`, `xclip`, `xsel`, `pbcopy`, then OSC 52.
+
+## navsplat
+
+Run the interactive picker from inside a Rust project:
+
+```sh
+navsplat
+```
+
+Start with an initial query:
+
+```sh
+navsplat pick '#main'
+```
+
+Use a specific workspace root or editor:
+
+```sh
+navsplat --root ~/src/my-crate --editor 'vim' pick HashMap
+```
+
+Print matches without opening the TUI:
+
+```sh
+navsplat symbols '#main'
+```
+
+Options:
+
+```text
+--root PATH       Workspace root. Defaults to the nearest Cargo.toml or .git.
+--editor CMD      Editor command. Defaults to $VISUAL, $EDITOR, then vi.
+--height ROWS     Inline picker height. Defaults to 20.
+```
+
+Picker keys:
+
+```text
+Enter             Open the selected symbol, or promote a selected side-pane hit
+Esc, Ctrl-C       Quit
+q                 Quit when the search input is empty
+Up/Down           Move selection
+Ctrl-P/Ctrl-N     Move selection
+PageUp/PageDown   Move by larger steps
+Shift-Up/Down     Scroll the preview pane
+Tab               Switch focus between symbols and the side pane
+Alt-R             Show references
+Alt-C             Show callers
+Alt-E             Show callees
+Alt-S             Return the right pane to source preview mode
+Backspace         Pop back after promoting a side-pane hit
+Alt-Y             Copy the selected location
+```
+
+The preview is centered around the selected symbol when possible. References,
+callers, and callees are loaded lazily for the current selection.
+
+## inmacs
+
+Open a file in the inline editor:
+
+```sh
+inmacs src/lib.rs
+```
+
+Open at a line:
+
+```sh
+inmacs +120 src/lib.rs
+inmacs --line 120 src/lib.rs
+```
+
+Set the inline viewport height:
+
+```sh
+inmacs --height 18 src/lib.rs
+```
+
+Core keys:
+
+```text
+Ctrl-X Ctrl-S     Save
+Ctrl-X Ctrl-C     Quit
+Ctrl-S            Incremental search forward
+Ctrl-R            Incremental search backward
+Ctrl-S/Ctrl-R     Repeat search while searching
+Enter             Finish search while searching
+Esc, Ctrl-G       Cancel search while searching
+Ctrl-G            Cancel active mark outside search
+Ctrl-A/Ctrl-E     Start/end of line
+Ctrl-B/Ctrl-F     Character left/right
+Alt-B/Alt-F       Word left/right
+Alt-Q             Fill/reflow the current paragraph to 80 columns
+Ctrl-Left/Right   Word left/right
+Ctrl-P/Ctrl-N     Line up/down
+Alt-V/Ctrl-V      Page up/down
+PageUp/PageDown   Page up/down
+Alt-Up/Down       Shrink/grow the inline viewport
+Ctrl-Space        Set or clear mark
+Ctrl-W            Kill active region
+Alt-W             Copy active region
+Ctrl-Y            Yank
+Ctrl-K            Kill to end of line
+Ctrl-D/Delete     Delete character
+Backspace         Delete backward
+Ctrl-/ Ctrl-_     Undo
+Ctrl-7            Undo
+Ctrl-?            Redo, where the terminal reports it distinctly
+```
+
+`inmacs` uses `ropey` internally for text storage and `syntect` for syntax
+highlighting.
+
+## inpage
+
+Open a read-only inline pager:
+
+```sh
+inpage src/lib.rs
+inpage +120 src/lib.rs
+```
+
+`inpage` accepts the same `--height`, `--line`, and `+LINE` arguments as
+`inmacs`. Editing keys are disabled, but movement and search keys are shared.
+
+Additional pager quit keys:
+
+```text
+Esc
+q
+```
+
+## Development
+
+Useful checks:
+
+```sh
+cargo fmt
+cargo check --bins
+cargo test --lib
+cargo build --bins
+```
