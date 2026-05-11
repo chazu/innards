@@ -1,0 +1,17 @@
+[package]
+name = "navsplat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.5.51", features = ["derive"] }
+crossterm = "0.29.0"
+ratatui = "0.30.0"
+ropey = "1.6.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+syntect = "5.3.0"
+tui-spinner = "0.2.3"
+tui-input = "0.15.3"
+url = "2.5.7"
