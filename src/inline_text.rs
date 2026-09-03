@@ -1,18 +1,27 @@
 use std::env;
-use std::fs;
-use std::io::{self, Stdout, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 use anyhow::{Context, Result, anyhow};
 use crossterm::ExecutableCommand;
 use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
+use ratatui::buffer::Cell;
+use ratatui::layout::{Position, Size};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use ropey::Rope;
+use serde::Serialize;
+use signal_hook::{consts::TERM_SIGNALS, flag};
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
@@ -48,27 +57,35 @@ impl Mode {
     }
 }
 
-pub fn run(mode: Mode) -> Result<()> {
+pub fn run(mode: Mode) -> Result<u8> {
     let config = Config::parse(env::args().skip(1), mode)?;
     let mut app = Editor::open(config.path.clone(), config.line, config.height, mode)?;
-    let syntax = SyntaxHighlighter::new(&config.path)?;
+    let syntax = SyntaxHighlighter::new(config.path.as_ref())?;
+    let interrupted = install_termination_handlers()?;
 
     let mut terminal = TerminalGuard::enter(config.height)?;
     terminal
         .terminal
         .draw(|frame| render::draw(frame, &mut app, &syntax, mode))?;
-    let outcome = run_editor(&mut terminal, &mut app, &syntax, mode)?;
+    let outcome = run_editor(&mut terminal, &mut app, &syntax, mode, &interrupted)?;
     drop(terminal);
 
-    match outcome {
-        Outcome::Quit => Ok(()),
+    if config.result_json {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        serde_json::to_writer(&mut stdout, &app.result(outcome))?;
+        writeln!(stdout)?;
     }
+
+    Ok(outcome.exit_code())
 }
 
+#[derive(Debug)]
 struct Config {
-    path: PathBuf,
+    path: Option<PathBuf>,
     height: u16,
     line: Option<usize>,
+    result_json: bool,
 }
 
 impl Config {
@@ -76,6 +93,8 @@ impl Config {
         let mut height = DEFAULT_HEIGHT;
         let mut line = None;
         let mut path = None;
+        let mut read_stdin = false;
+        let mut result_json = false;
         let mut args = args.peekable();
 
         while let Some(arg) = args.next() {
@@ -97,22 +116,46 @@ impl Config {
                 line = Some(parse_line_number(&value)?);
             } else if let Some(value) = arg.strip_prefix("--line=") {
                 line = Some(parse_line_number(value)?);
+            } else if arg == "--stdin" || arg == "-" {
+                if read_stdin || path.is_some() {
+                    return Err(anyhow!("input may be specified only once"));
+                }
+                read_stdin = true;
+            } else if arg == "--result-json" {
+                result_json = true;
             } else if let Some(value) = arg.strip_prefix('+') {
                 if !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()) {
                     line = Some(parse_line_number(value)?);
+                } else if read_stdin || path.is_some() {
+                    return Err(anyhow!("input may be specified only once"));
                 } else {
                     path = Some(PathBuf::from(arg));
                 }
-            } else if path.is_none() {
+            } else if path.is_none() && !read_stdin {
                 path = Some(PathBuf::from(arg));
             } else {
-                return Err(anyhow!("unexpected argument: {arg}"));
+                return Err(anyhow!("input may be specified only once: {arg}"));
             }
         }
 
-        let path =
-            path.ok_or_else(|| anyhow!("usage: {} [--height N] [+LINE] FILE", mode.title()))?;
-        Ok(Self { path, height, line })
+        if read_stdin && mode.is_editable() {
+            return Err(anyhow!(
+                "inmacs stdin editing needs an explicit output destination; use a file for now"
+            ));
+        }
+        if !read_stdin && path.is_none() {
+            return Err(anyhow!(
+                "usage: {} [--height N] [+LINE] [--result-json] FILE\n       inpage [--height N] [+LINE] [--result-json] --stdin",
+                mode.title()
+            ));
+        }
+
+        Ok(Self {
+            path,
+            height,
+            line,
+            result_json,
+        })
     }
 }
 
@@ -123,9 +166,40 @@ fn parse_line_number(value: &str) -> Result<usize> {
     Ok(line.max(1))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum Outcome {
-    Quit,
+    Saved,
+    Unchanged,
+    Discarded,
+    Closed,
+    Cancelled,
+}
+
+impl Outcome {
+    fn exit_code(self) -> u8 {
+        match self {
+            Self::Saved | Self::Unchanged | Self::Closed => 0,
+            Self::Discarded => 3,
+            Self::Cancelled => 130,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CursorResult {
+    line: usize,
+    column: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct RunResult {
+    schema_version: u8,
+    outcome: Outcome,
+    path: Option<String>,
+    changed: bool,
+    cursor: CursorResult,
+    edit_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,7 +231,9 @@ struct EditorSnapshot {
 }
 
 struct Editor {
-    path: PathBuf,
+    path: Option<PathBuf>,
+    display_path: String,
+    initial_content: String,
     buffer: Rope,
     cursor_line: usize,
     cursor_col: usize,
@@ -174,15 +250,30 @@ struct Editor {
     mark: Option<BufferPoint>,
     undo_stack: Vec<EditorSnapshot>,
     redo_stack: Vec<EditorSnapshot>,
+    edit_count: usize,
+    save_count: usize,
 }
 
 impl Editor {
-    fn open(path: PathBuf, line: Option<usize>, height: u16, mode: Mode) -> Result<Self> {
-        let content = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
-            Err(err) => {
-                return Err(err).with_context(|| format!("failed to read {}", path.display()));
+    fn open(path: Option<PathBuf>, line: Option<usize>, height: u16, mode: Mode) -> Result<Self> {
+        let (content, display_path) = match path.as_ref() {
+            Some(path) => {
+                let content = match fs::read_to_string(path) {
+                    Ok(content) => content,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| format!("failed to read {}", path.display()));
+                    }
+                };
+                (content, path.display().to_string())
+            }
+            None => {
+                let mut content = String::new();
+                io::stdin()
+                    .read_to_string(&mut content)
+                    .context("failed to read stdin")?;
+                (content, "<stdin>".to_string())
             }
         };
         let buffer = Rope::from_str(&content);
@@ -195,6 +286,8 @@ impl Editor {
 
         Ok(Self {
             path,
+            display_path,
+            initial_content: content,
             buffer,
             cursor_line,
             cursor_col: 0,
@@ -211,18 +304,51 @@ impl Editor {
             mark: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            edit_count: 0,
+            save_count: 0,
         })
     }
 
     fn save(&mut self) -> Result<()> {
-        let mut file = fs::File::create(&self.path)
-            .with_context(|| format!("failed to write {}", self.path.display()))?;
+        let path = self
+            .path
+            .as_ref()
+            .ok_or_else(|| anyhow!("stdin buffer has no output path"))?;
+        let mut file = fs::File::create(path)
+            .with_context(|| format!("failed to write {}", path.display()))?;
         self.buffer
             .write_to(&mut file)
-            .with_context(|| format!("failed to write {}", self.path.display()))?;
+            .with_context(|| format!("failed to write {}", path.display()))?;
         self.dirty = false;
-        self.status = format!("saved {}", self.path.display());
+        self.save_count += 1;
+        self.status = format!("saved {}", path.display());
         Ok(())
+    }
+
+    fn result(&self, outcome: Outcome) -> RunResult {
+        RunResult {
+            schema_version: 1,
+            outcome,
+            path: self.path.as_ref().map(|path| path.display().to_string()),
+            changed: self.buffer != self.initial_content,
+            cursor: CursorResult {
+                line: self.cursor_line + 1,
+                column: self.cursor_col + 1,
+            },
+            edit_count: self.edit_count,
+        }
+    }
+
+    fn quit_outcome(&self, mode: Mode) -> Outcome {
+        if mode == Mode::View {
+            Outcome::Closed
+        } else if self.dirty {
+            Outcome::Discarded
+        } else if self.save_count > 0 {
+            Outcome::Saved
+        } else {
+            Outcome::Unchanged
+        }
     }
 
     fn line_len(&self) -> usize {
@@ -268,6 +394,7 @@ impl Editor {
     fn record_edit(&mut self) {
         self.undo_stack.push(self.snapshot());
         self.redo_stack.clear();
+        self.edit_count += 1;
     }
 
     fn undo(&mut self) {
@@ -823,7 +950,7 @@ struct SyntaxHighlighter {
 }
 
 impl SyntaxHighlighter {
-    fn new(path: &PathBuf) -> Result<Self> {
+    fn new(path: Option<&PathBuf>) -> Result<Self> {
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let theme_set = ThemeSet::load_defaults();
         let theme = theme_set
@@ -832,10 +959,8 @@ impl SyntaxHighlighter {
             .or_else(|| theme_set.themes.values().next())
             .cloned()
             .ok_or_else(|| anyhow!("no syntect themes available"))?;
-        let syntax = syntax_set
-            .find_syntax_for_file(path)
-            .ok()
-            .flatten()
+        let syntax = path
+            .and_then(|path| syntax_set.find_syntax_for_file(path).ok().flatten())
             .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
         let syntax_name = syntax.name.clone();
 
@@ -858,9 +983,21 @@ fn run_editor(
     app: &mut Editor,
     syntax: &SyntaxHighlighter,
     mode: Mode,
+    interrupted: &AtomicBool,
 ) -> Result<Outcome> {
     loop {
-        if event::poll(Duration::from_millis(80))? {
+        if interrupted.load(Ordering::Relaxed) {
+            return Ok(Outcome::Cancelled);
+        }
+
+        let ready = match event::poll(Duration::from_millis(80)) {
+            Ok(ready) => ready,
+            Err(_err) if interrupted.load(Ordering::Relaxed) => {
+                return Ok(Outcome::Cancelled);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if ready {
             match event::read() {
                 Ok(Event::Key(key))
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
@@ -896,7 +1033,10 @@ fn handle_key(
     }
 
     match key.code {
-        _ if is_view_quit_key(mode, key) => return Ok(Some(Outcome::Quit)),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return Ok(Some(Outcome::Cancelled));
+        }
+        _ if is_view_quit_key(mode, key) => return Ok(Some(app.quit_outcome(mode))),
         KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.ctrl_x_pending = true;
             app.status = "Ctrl-X ...".to_string();
@@ -1018,7 +1158,7 @@ fn handle_ctrl_x_chord(app: &mut Editor, key: KeyEvent, mode: Mode) -> Result<Op
     app.ctrl_x_pending = false;
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Ok(Some(Outcome::Quit))
+            Ok(Some(app.quit_outcome(mode)))
         }
         KeyCode::Char('s')
             if mode.is_editable() && key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -1216,7 +1356,9 @@ mod tests {
 
     fn editor_with(text: &str) -> Editor {
         Editor {
-            path: PathBuf::from("test.txt"),
+            path: Some(PathBuf::from("test.txt")),
+            display_path: "test.txt".to_string(),
+            initial_content: text.to_string(),
             buffer: Rope::from_str(text),
             cursor_line: 0,
             cursor_col: 0,
@@ -1233,6 +1375,8 @@ mod tests {
             mark: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            edit_count: 0,
+            save_count: 0,
         }
     }
 
@@ -1476,7 +1620,7 @@ mod tests {
         let exit = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(
             handle_ctrl_x_chord(&mut editor, exit, Mode::Edit).unwrap(),
-            Some(Outcome::Quit)
+            Some(Outcome::Unchanged)
         );
         assert!(!editor.ctrl_x_pending);
         assert!(editor.search.is_some());
@@ -1500,6 +1644,68 @@ mod tests {
     }
 
     #[test]
+    fn dirty_editor_quit_is_discarded() {
+        let mut editor = editor_with("abc");
+        editor.insert_char('x');
+
+        assert_eq!(editor.quit_outcome(Mode::Edit), Outcome::Discarded);
+        assert_eq!(editor.quit_outcome(Mode::Edit).exit_code(), 3);
+    }
+
+    #[test]
+    fn saved_editor_quit_is_saved() {
+        let mut editor = editor_with("abc");
+        editor.save_count = 1;
+
+        assert_eq!(editor.quit_outcome(Mode::Edit), Outcome::Saved);
+        assert_eq!(editor.quit_outcome(Mode::Edit).exit_code(), 0);
+    }
+
+    #[test]
+    fn view_quit_is_a_successful_close() {
+        let editor = editor_with("abc");
+
+        assert_eq!(editor.quit_outcome(Mode::View), Outcome::Closed);
+        assert_eq!(editor.quit_outcome(Mode::View).exit_code(), 0);
+    }
+
+    #[test]
+    fn config_accepts_stdin_for_inpage() {
+        let config = Config::parse(
+            ["--stdin".to_string(), "--result-json".to_string()].into_iter(),
+            Mode::View,
+        )
+        .unwrap();
+
+        assert_eq!(config.path, None);
+        assert!(config.result_json);
+    }
+
+    #[test]
+    fn config_rejects_stdin_for_inmacs_until_output_is_supported() {
+        let error = Config::parse(["--stdin".to_string()].into_iter(), Mode::Edit).unwrap_err();
+
+        assert!(error.to_string().contains("explicit output destination"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_position_response_is_converted_to_zero_based_coordinates() {
+        assert_eq!(
+            parse_cursor_position(b"\x1b[12;34R").unwrap(),
+            Position::new(33, 11)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_position_response_rejects_zero_coordinates() {
+        let error = parse_cursor_position(b"\x1b[0;1R").unwrap_err();
+
+        assert!(error.to_string().contains("one-based"));
+    }
+
+    #[test]
     fn resize_anchor_preserves_top_when_growing() {
         assert_eq!(resize_anchor_row(8, 16, 17, 24), 8);
     }
@@ -1510,20 +1716,118 @@ mod tests {
     }
 }
 
+fn install_termination_handlers() -> Result<Arc<AtomicBool>> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    for signal in TERM_SIGNALS {
+        flag::register(*signal, Arc::clone(&interrupted))?;
+    }
+    Ok(interrupted)
+}
+
+fn open_terminal_device() -> Result<File> {
+    #[cfg(unix)]
+    let path = "/dev/tty";
+    #[cfg(windows)]
+    let path = "CONOUT$";
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open terminal device {path}"))
+}
+
+struct TtyBackend {
+    inner: CrosstermBackend<File>,
+    cursor_position: Position,
+}
+
+impl Backend for TtyBackend {
+    type Error = io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        self.inner.draw(content)
+    }
+
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        self.inner.append_lines(n)
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        Ok(self.cursor_position)
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        let position = position.into();
+        self.inner.set_cursor_position(position)?;
+        self.cursor_position = position;
+        Ok(())
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Backend::flush(&mut self.inner)
+    }
+}
+
 struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<TtyBackend>,
+    tty: File,
 }
 
 impl TerminalGuard {
     fn enter(height: u16) -> Result<Self> {
         enable_raw_mode()?;
-        let terminal = Self::new_terminal(height)?;
-        Ok(Self { terminal })
+        let tty = match open_terminal_device() {
+            Ok(tty) => tty,
+            Err(err) => {
+                let _ = disable_raw_mode();
+                return Err(err);
+            }
+        };
+        let terminal = match Self::new_terminal(&tty, height) {
+            Ok(terminal) => terminal,
+            Err(err) => {
+                let _ = disable_raw_mode();
+                return Err(err);
+            }
+        };
+        Ok(Self { terminal, tty })
     }
 
-    fn new_terminal(height: u16) -> Result<Terminal<CrosstermBackend<Stdout>>> {
-        let stdout = io::stdout();
-        let backend = CrosstermBackend::new(stdout);
+    fn new_terminal(tty: &File, height: u16) -> Result<Terminal<TtyBackend>> {
+        let mut terminal_io = tty.try_clone()?;
+        let cursor_position = query_cursor_position(&mut terminal_io)?;
+        let backend = TtyBackend {
+            inner: CrosstermBackend::new(terminal_io),
+            cursor_position,
+        };
         let terminal = Terminal::with_options(
             backend,
             TerminalOptions {
@@ -1535,10 +1839,77 @@ impl TerminalGuard {
 
     fn resize(&mut self, height: u16, anchor_y: u16) -> Result<()> {
         self.terminal.clear()?;
-        io::stdout().execute(MoveTo(0, anchor_y))?;
-        self.terminal = Self::new_terminal(height)?;
+        self.tty.execute(MoveTo(0, anchor_y))?;
+        self.terminal = Self::new_terminal(&self.tty, height)?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn query_cursor_position(tty: &mut File) -> Result<Position> {
+    tty.write_all(b"\x1b[6n")?;
+    tty.flush()?;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut response = Vec::with_capacity(16);
+    while Instant::now() < deadline && response.len() < 64 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: tty.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: descriptor points to one initialized pollfd for the duration
+        // of the call, and tty remains open throughout the loop.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if ready == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("failed while waiting for cursor position");
+        }
+        if ready == 0 {
+            break;
+        }
+
+        let mut byte = [0_u8; 1];
+        tty.read_exact(&mut byte)?;
+        response.push(byte[0]);
+        if byte[0] == b'R' {
+            return parse_cursor_position(&response);
+        }
+    }
+
+    Err(anyhow!("terminal did not report its cursor position"))
+}
+
+#[cfg(unix)]
+fn parse_cursor_position(response: &[u8]) -> Result<Position> {
+    let response = std::str::from_utf8(response).context("cursor position was not UTF-8")?;
+    let start = response
+        .rfind("\x1b[")
+        .ok_or_else(|| anyhow!("cursor position response had no CSI prefix"))?;
+    let coordinates = response[start + 2..]
+        .strip_suffix('R')
+        .ok_or_else(|| anyhow!("cursor position response had no terminator"))?;
+    let (row, column) = coordinates
+        .split_once(';')
+        .ok_or_else(|| anyhow!("cursor position response had no separator"))?;
+    let row = row.parse::<u16>().context("invalid cursor row")?;
+    let column = column.parse::<u16>().context("invalid cursor column")?;
+    if row == 0 || column == 0 {
+        return Err(anyhow!("cursor position must be one-based"));
+    }
+    Ok(Position::new(column - 1, row - 1))
+}
+
+#[cfg(windows)]
+fn query_cursor_position(_tty: &mut File) -> Result<Position> {
+    crossterm::cursor::position()
+        .map(|(x, y)| Position::new(x, y))
+        .map_err(Into::into)
 }
 
 impl Drop for TerminalGuard {
@@ -1546,6 +1917,6 @@ impl Drop for TerminalGuard {
         let _ = self.terminal.clear();
         let _ = disable_raw_mode();
         let _ = self.terminal.show_cursor();
-        let _ = io::stdout().flush();
+        let _ = self.tty.flush();
     }
 }

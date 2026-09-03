@@ -21,7 +21,7 @@ pub(super) fn draw(
     app.last_drawn_height = area.height;
     app.last_drawn_top = area.y;
     let block = Block::default()
-        .title(format!(" {}: {} ", mode.title(), app.path.display()))
+        .title(format!(" {}: {} ", mode.title(), app.display_path))
         .borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);

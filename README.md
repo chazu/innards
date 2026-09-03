@@ -138,6 +138,18 @@ Set the inline viewport height:
 inmacs --height 18 src/lib.rs
 ```
 
+Report the editor outcome as one JSON record on stdout. The interface itself
+still renders on the controlling terminal, so callers can capture the result:
+
+```sh
+result=$(inmacs --result-json src/lib.rs)
+```
+
+The process exits 0 after a save or an unchanged close, 3 when dirty edits are
+discarded, and 130 when cancelled with Ctrl-C or interrupted by a termination
+signal. The result distinguishes `saved`, `unchanged`, `discarded`, and
+`cancelled` outcomes.
+
 Core keys:
 
 ```text
@@ -185,6 +197,17 @@ inpage +120 src/lib.rs
 `inpage` accepts the same `--height`, `--line`, and `+LINE` arguments as
 `inmacs`. Editing keys are disabled, but movement and search keys are shared.
 
+It can also read piped content while keeping terminal drawing separate from
+stdout:
+
+```sh
+result=$(printf 'one\ntwo\n' | inpage --stdin --result-json)
+```
+
+`-` is an alias for `--stdin`. JSON output reports `closed` after a normal quit
+or `cancelled` after Ctrl-C or a termination signal. Stdin editing for `inmacs`
+is intentionally deferred until an explicit output destination is implemented.
+
 Additional pager quit keys:
 
 ```text
@@ -200,6 +223,7 @@ Useful checks:
 cargo fmt
 cargo check --bins
 cargo test --lib
+cargo test --test terminal_contract  # Unix PTY contract (requires Expect)
 cargo build --bins
 ```
 
