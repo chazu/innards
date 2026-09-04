@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use syntect::easy::HighlightLines;
 
-use super::{Editor, Mode, SyntaxHighlighter, line_selection_range, line_text};
+use super::{AnnotationSeverity, Editor, Mode, SyntaxHighlighter, line_selection_range, line_text};
 
 pub(super) fn draw(
     frame: &mut Frame<'_>,
@@ -38,12 +38,24 @@ pub(super) fn draw(
     frame.render_widget(Paragraph::new(lines), text_area);
 
     let dirty = if app.dirty { " *" } else { "" };
+    let status_text = app
+        .annotation_for_line(app.cursor_line)
+        .map(|annotation| {
+            format!(
+                "{} {}:{}: {}",
+                severity_label(&annotation.severity),
+                annotation.line,
+                annotation.column,
+                annotation.message
+            )
+        })
+        .unwrap_or_else(|| app.status.clone());
     let status = Line::from(vec![
         Span::styled(
             format!("{}:{}{}  ", app.cursor_line + 1, app.cursor_col + 1, dirty),
             Style::default().fg(Color::Cyan),
         ),
-        Span::raw(app.status.clone()),
+        Span::raw(status_text),
     ]);
     frame.render_widget(Paragraph::new(status), status_area);
 
@@ -72,12 +84,20 @@ fn render_lines(
     for idx in app.scroll_y..end {
         let line = line_text(&app.buffer, idx);
         let line_region = line_selection_range(app, idx, active_region.as_ref());
+        let annotation = app.annotation_for_line(idx);
         let highlighted = highlighter
             .highlight_line(&line, &syntax.syntax_set)
             .unwrap_or_else(|_| vec![(syntect::highlighting::Style::default(), line.as_str())]);
+        let (marker, gutter_style) = annotation
+            .map(|annotation| match annotation.severity {
+                AnnotationSeverity::Error => ('!', Style::default().fg(Color::Red)),
+                AnnotationSeverity::Warning => ('!', Style::default().fg(Color::Yellow)),
+                AnnotationSeverity::Info => ('i', Style::default().fg(Color::Cyan)),
+            })
+            .unwrap_or((' ', Style::default().fg(Color::DarkGray)));
         let mut spans = vec![Span::styled(
-            format!("{:>width$} ", idx + 1, width = prefix_width - 1),
-            Style::default().fg(Color::DarkGray),
+            format!("{:>width$}{marker} ", idx + 1, width = prefix_width - 2),
+            gutter_style,
         )];
         spans.extend(slice_highlighted_line(
             highlighted,
@@ -85,6 +105,16 @@ fn render_lines(
             text_width,
             line_region,
         ));
+        if let Some(annotation) = annotation {
+            spans.push(Span::styled(
+                format!(
+                    "  [{}] {}",
+                    severity_label(&annotation.severity),
+                    annotation.message
+                ),
+                gutter_style.add_modifier(Modifier::DIM),
+            ));
+        }
         output.push(Line::from(spans));
     }
 
@@ -96,6 +126,14 @@ fn render_lines(
     }
 
     output
+}
+
+fn severity_label(severity: &AnnotationSeverity) -> &'static str {
+    match severity {
+        AnnotationSeverity::Error => "error",
+        AnnotationSeverity::Warning => "warning",
+        AnnotationSeverity::Info => "info",
+    }
 }
 
 fn slice_highlighted_line(

@@ -1,35 +1,27 @@
-use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::ops::Range;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
-
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use crossterm::ExecutableCommand;
-use crossterm::cursor::MoveTo;
+use clap::Args;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
-use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
-use ratatui::buffer::Cell;
-use ratatui::layout::{Position, Size};
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use crossterm::terminal::size;
 use ropey::Rope;
-use serde::Serialize;
-use signal_hook::{consts::TERM_SIGNALS, flag};
+use serde::{Deserialize, Serialize};
 use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::parsing::{SyntaxDefinition, SyntaxReference, SyntaxSet};
 
 mod render;
+
+use crate::inline_terminal::{InlineTerminal, termination_flag};
 
 const DEFAULT_HEIGHT: u16 = 16;
 const MIN_HEIGHT: u16 = 5;
 const DEFAULT_FILL_COLUMN: usize = 80;
+const DEFAULT_TAB_WIDTH: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -38,7 +30,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    fn title(self) -> &'static str {
+    pub fn title(self) -> &'static str {
         match self {
             Self::Edit => "inmacs",
             Self::View => "inpage",
@@ -52,123 +44,244 @@ impl Mode {
         }
     }
 
-    fn is_editable(self) -> bool {
+    pub fn is_editable(self) -> bool {
         matches!(self, Self::Edit)
     }
 }
 
-pub fn run(mode: Mode) -> Result<u8> {
-    let config = Config::parse(env::args().skip(1), mode)?;
-    let mut app = Editor::open(config.path.clone(), config.line, config.height, mode)?;
-    let syntax = SyntaxHighlighter::new(config.path.as_ref())?;
-    let interrupted = install_termination_handlers()?;
+#[derive(Args, Clone, Debug)]
+pub struct CliArgs {
+    /// File to edit or view.
+    #[arg(
+        value_name = "FILE",
+        conflicts_with = "stdin",
+        required_unless_present = "stdin"
+    )]
+    pub path: Option<PathBuf>,
 
-    let mut terminal = TerminalGuard::enter(config.height)?;
-    terminal
-        .terminal
-        .draw(|frame| render::draw(frame, &mut app, &syntax, mode))?;
-    let outcome = run_editor(&mut terminal, &mut app, &syntax, mode, &interrupted)?;
-    drop(terminal);
+    /// Read the initial buffer from stdin.
+    #[arg(long, conflicts_with = "path")]
+    pub stdin: bool,
 
-    if config.result_json {
-        let stdout = io::stdout();
-        let mut stdout = stdout.lock();
-        serde_json::to_writer(&mut stdout, &app.result(outcome))?;
-        writeln!(stdout)?;
-    }
+    /// Save stdin-backed edits to this path.
+    #[arg(short, long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
 
-    Ok(outcome.exit_code())
+    #[arg(long, default_value_t = DEFAULT_HEIGHT)]
+    pub height: u16,
+
+    #[arg(long)]
+    pub line: Option<usize>,
+
+    #[arg(long)]
+    pub column: Option<usize>,
+
+    #[arg(long)]
+    pub title: Option<String>,
+
+    #[arg(long)]
+    pub status: Option<String>,
+
+    #[arg(long)]
+    pub tab_width: Option<usize>,
+
+    #[arg(long)]
+    pub syntax: Option<String>,
+
+    /// Read a versioned annotation document from this path.
+    #[arg(long, value_name = "FILE")]
+    pub annotations: Option<PathBuf>,
+
+    /// Write one structured outcome record to stdout after terminal cleanup.
+    #[arg(long)]
+    pub result_json: bool,
 }
 
-#[derive(Debug)]
-struct Config {
-    path: Option<PathBuf>,
-    height: u16,
-    line: Option<usize>,
-    result_json: bool,
-}
+impl CliArgs {
+    pub fn into_invocation(self, mode: Mode) -> Result<Invocation> {
+        if self.output.is_some() && !self.stdin {
+            return Err(anyhow!("--output is only valid with --stdin"));
+        }
+        if self.stdin && mode.is_editable() && self.output.is_none() {
+            return Err(anyhow!("inmacs --stdin requires --output FILE"));
+        }
+        if self.tab_width == Some(0) {
+            return Err(anyhow!("--tab-width must be greater than zero"));
+        }
 
-impl Config {
-    fn parse(args: impl Iterator<Item = String>, mode: Mode) -> Result<Self> {
-        let mut height = DEFAULT_HEIGHT;
-        let mut line = None;
-        let mut path = None;
-        let mut read_stdin = false;
-        let mut result_json = false;
-        let mut args = args.peekable();
-
-        while let Some(arg) = args.next() {
-            if arg == "--height" || arg == "-h" {
-                let value = args
-                    .next()
-                    .ok_or_else(|| anyhow!("{arg} requires a row count"))?;
-                height = value
-                    .parse::<u16>()
-                    .with_context(|| format!("invalid height: {value}"))?;
-            } else if let Some(value) = arg.strip_prefix("--height=") {
-                height = value
-                    .parse::<u16>()
-                    .with_context(|| format!("invalid height: {value}"))?;
-            } else if arg == "--line" {
-                let value = args
-                    .next()
-                    .ok_or_else(|| anyhow!("--line requires a line number"))?;
-                line = Some(parse_line_number(&value)?);
-            } else if let Some(value) = arg.strip_prefix("--line=") {
-                line = Some(parse_line_number(value)?);
-            } else if arg == "--stdin" || arg == "-" {
-                if read_stdin || path.is_some() {
-                    return Err(anyhow!("input may be specified only once"));
-                }
-                read_stdin = true;
-            } else if arg == "--result-json" {
-                result_json = true;
-            } else if let Some(value) = arg.strip_prefix('+') {
-                if !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()) {
-                    line = Some(parse_line_number(value)?);
-                } else if read_stdin || path.is_some() {
-                    return Err(anyhow!("input may be specified only once"));
-                } else {
-                    path = Some(PathBuf::from(arg));
-                }
-            } else if path.is_none() && !read_stdin {
-                path = Some(PathBuf::from(arg));
+        let annotations = match self.annotations {
+            Some(path) => AnnotationDocument::read(&path)?.annotations,
+            None => Vec::new(),
+        };
+        let tab_width = self.tab_width.unwrap_or_else(|| {
+            if is_trashtalk_syntax(self.syntax.as_deref(), self.path.as_deref()) {
+                2
             } else {
-                return Err(anyhow!("input may be specified only once: {arg}"));
+                DEFAULT_TAB_WIDTH
             }
-        }
+        });
 
-        if read_stdin && mode.is_editable() {
-            return Err(anyhow!(
-                "inmacs stdin editing needs an explicit output destination; use a file for now"
-            ));
-        }
-        if !read_stdin && path.is_none() {
-            return Err(anyhow!(
-                "usage: {} [--height N] [+LINE] [--result-json] FILE\n       inpage [--height N] [+LINE] [--result-json] --stdin",
-                mode.title()
-            ));
-        }
-
-        Ok(Self {
-            path,
-            height,
-            line,
-            result_json,
+        Ok(Invocation {
+            config: Config {
+                mode,
+                input_path: self.path,
+                output_path: self.output,
+                height: self.height.max(MIN_HEIGHT),
+                line: self.line.map(|line| line.max(1)),
+                column: self.column.map(|column| column.max(1)),
+                title: self.title,
+                status: self.status,
+                tab_width,
+                syntax: self.syntax,
+                annotations,
+            },
+            result_json: self.result_json,
         })
     }
 }
 
-fn parse_line_number(value: &str) -> Result<usize> {
-    let line = value
-        .parse::<usize>()
-        .with_context(|| format!("invalid line number: {value}"))?;
-    Ok(line.max(1))
+#[derive(Clone, Debug)]
+pub struct Invocation {
+    pub config: Config,
+    pub result_json: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub mode: Mode,
+    pub input_path: Option<PathBuf>,
+    pub output_path: Option<PathBuf>,
+    pub height: u16,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub title: Option<String>,
+    pub status: Option<String>,
+    pub tab_width: usize,
+    pub syntax: Option<String>,
+    pub annotations: Vec<Annotation>,
+}
+
+impl Config {
+    pub fn for_path(mode: Mode, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let tab_width = if is_trashtalk_syntax(None, Some(&path)) {
+            2
+        } else {
+            DEFAULT_TAB_WIDTH
+        };
+        Self {
+            mode,
+            input_path: Some(path),
+            output_path: None,
+            height: DEFAULT_HEIGHT,
+            line: None,
+            column: None,
+            title: None,
+            status: None,
+            tab_width,
+            syntax: None,
+            annotations: Vec::new(),
+        }
+    }
+}
+
+pub fn run_with(config: Config) -> Result<RunResult> {
+    let mut app = Editor::open(&config)?;
+    let syntax = SyntaxHighlighter::new(config.syntax.as_deref(), config.input_path.as_deref())?;
+    let interrupted = termination_flag()?;
+
+    let mut terminal = InlineTerminal::enter(config.height)?;
+    terminal.draw(|frame| render::draw(frame, &mut app, &syntax, config.mode))?;
+    let outcome = run_editor(&mut terminal, &mut app, &syntax, config.mode, &interrupted)?;
+    drop(terminal);
+
+    Ok(app.result(outcome))
+}
+
+pub fn write_result_json(result: &RunResult) -> Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer(&mut stdout, result)?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
+pub fn normalize_plus_line_args<I>(args: I) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let mut normalized = Vec::new();
+    for (index, arg) in args.into_iter().enumerate() {
+        if index > 0
+            && let Some(value) = arg.to_str().and_then(|arg| arg.strip_prefix('+'))
+            && !value.is_empty()
+            && value.chars().all(|ch| ch.is_ascii_digit())
+        {
+            normalized.push("--line".into());
+            normalized.push(value.into());
+        } else if arg == "-" {
+            normalized.push("--stdin".into());
+        } else {
+            normalized.push(arg);
+        }
+    }
+    normalized
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Outcome {
+pub enum AnnotationSeverity {
+    Error,
+    Warning,
+    Info,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Annotation {
+    pub line: usize,
+    #[serde(default = "one")]
+    pub column: usize,
+    pub severity: AnnotationSeverity,
+    pub message: String,
+}
+
+fn one() -> usize {
+    1
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AnnotationDocument {
+    pub schema_version: u8,
+    #[serde(default)]
+    pub annotations: Vec<Annotation>,
+}
+
+impl AnnotationDocument {
+    pub fn read(path: &Path) -> Result<Self> {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("failed to read annotations from {}", path.display()))?;
+        let document: Self = serde_json::from_str(&contents)
+            .with_context(|| format!("invalid annotations in {}", path.display()))?;
+        if document.schema_version != 1 {
+            return Err(anyhow!(
+                "unsupported annotation schema version {}",
+                document.schema_version
+            ));
+        }
+        if document
+            .annotations
+            .iter()
+            .any(|item| item.line == 0 || item.column == 0)
+        {
+            return Err(anyhow!("annotation positions must be one-based"));
+        }
+        Ok(document)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
     Saved,
     Unchanged,
     Discarded,
@@ -177,7 +290,7 @@ enum Outcome {
 }
 
 impl Outcome {
-    fn exit_code(self) -> u8 {
+    pub fn exit_code(self) -> u8 {
         match self {
             Self::Saved | Self::Unchanged | Self::Closed => 0,
             Self::Discarded => 3,
@@ -186,20 +299,20 @@ impl Outcome {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct CursorResult {
-    line: usize,
-    column: usize,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CursorResult {
+    pub line: usize,
+    pub column: usize,
 }
 
-#[derive(Debug, Serialize)]
-struct RunResult {
-    schema_version: u8,
-    outcome: Outcome,
-    path: Option<String>,
-    changed: bool,
-    cursor: CursorResult,
-    edit_count: usize,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunResult {
+    pub schema_version: u8,
+    pub outcome: Outcome,
+    pub path: Option<String>,
+    pub changed: bool,
+    pub cursor: CursorResult,
+    pub edit_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,10 +343,28 @@ struct EditorSnapshot {
     mark: Option<BufferPoint>,
 }
 
-struct Editor {
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DiskState {
+    Missing,
+    Present(String),
+}
+
+impl DiskState {
+    fn read(path: &Path) -> Result<Self> {
+        match fs::read_to_string(path) {
+            Ok(contents) => Ok(Self::Present(contents)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::Missing),
+            Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+        }
+    }
+}
+
+pub struct Editor {
     path: Option<PathBuf>,
     display_path: String,
     initial_content: String,
+    expected_disk_state: DiskState,
+    conflict_confirmation: Option<DiskState>,
     buffer: Rope,
     cursor_line: usize,
     cursor_col: usize,
@@ -252,11 +383,13 @@ struct Editor {
     redo_stack: Vec<EditorSnapshot>,
     edit_count: usize,
     save_count: usize,
+    tab_width: usize,
+    annotations: Vec<Annotation>,
 }
 
 impl Editor {
-    fn open(path: Option<PathBuf>, line: Option<usize>, height: u16, mode: Mode) -> Result<Self> {
-        let (content, display_path) = match path.as_ref() {
+    pub fn open(config: &Config) -> Result<Self> {
+        let (content, default_display_path) = match config.input_path.as_ref() {
             Some(path) => {
                 let content = match fs::read_to_string(path) {
                     Ok(content) => content,
@@ -276,29 +409,60 @@ impl Editor {
                 (content, "<stdin>".to_string())
             }
         };
+        let path = config
+            .output_path
+            .clone()
+            .or_else(|| config.input_path.clone());
+        if config.mode.is_editable()
+            && let Some(path) = path.as_deref()
+        {
+            reject_symlink(path)?;
+        }
+        let expected_disk_state = match path.as_deref() {
+            Some(path) => DiskState::read(path)?,
+            None => DiskState::Missing,
+        };
+        let display_path = config.title.clone().unwrap_or_else(|| {
+            config
+                .output_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or(default_display_path)
+        });
         let buffer = Rope::from_str(&content);
-        let cursor_line = line
+        let cursor_line = config
+            .line
             .map(|line| {
                 line.saturating_sub(1)
                     .min(buffer_line_count(&buffer).saturating_sub(1))
             })
             .unwrap_or(0);
+        let cursor_col = config
+            .column
+            .map(|column| column.saturating_sub(1))
+            .unwrap_or(0)
+            .min(line_len_chars(&buffer, cursor_line));
 
         Ok(Self {
             path,
             display_path,
             initial_content: content,
+            expected_disk_state,
+            conflict_confirmation: None,
             buffer,
             cursor_line,
-            cursor_col: 0,
+            cursor_col,
             scroll_y: 0,
             scroll_x: 0,
             kill_ring: String::new(),
             dirty: false,
-            status: mode.initial_status().to_string(),
+            status: config
+                .status
+                .clone()
+                .unwrap_or_else(|| config.mode.initial_status().to_string()),
             ctrl_x_pending: false,
-            height: height.max(MIN_HEIGHT),
-            last_drawn_height: height.max(MIN_HEIGHT),
+            height: config.height.max(MIN_HEIGHT),
+            last_drawn_height: config.height.max(MIN_HEIGHT),
             last_drawn_top: 0,
             search: None,
             mark: None,
@@ -306,23 +470,34 @@ impl Editor {
             redo_stack: Vec::new(),
             edit_count: 0,
             save_count: 0,
+            tab_width: config.tab_width,
+            annotations: config.annotations.clone(),
         })
     }
 
-    fn save(&mut self) -> Result<()> {
+    fn save(&mut self) -> Result<bool> {
         let path = self
             .path
             .as_ref()
             .ok_or_else(|| anyhow!("stdin buffer has no output path"))?;
-        let mut file = fs::File::create(path)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        self.buffer
-            .write_to(&mut file)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        reject_symlink(path)?;
+        let current_disk_state = DiskState::read(path)?;
+        if current_disk_state != self.expected_disk_state
+            && self.conflict_confirmation.as_ref() != Some(&current_disk_state)
+        {
+            self.conflict_confirmation = Some(current_disk_state);
+            self.status = "file changed on disk; Ctrl-X Ctrl-S again to overwrite".to_string();
+            return Ok(false);
+        }
+
+        let contents = self.buffer.to_string();
+        atomic_write(path, contents.as_bytes())?;
+        self.expected_disk_state = DiskState::Present(contents);
+        self.conflict_confirmation = None;
         self.dirty = false;
         self.save_count += 1;
         self.status = format!("saved {}", path.display());
-        Ok(())
+        Ok(true)
     }
 
     fn result(&self, outcome: Outcome) -> RunResult {
@@ -486,11 +661,27 @@ impl Editor {
     }
 
     fn insert_newline(&mut self) {
+        let indent: String = line_text(&self.buffer, self.cursor_line)
+            .chars()
+            .take(self.cursor_col)
+            .take_while(|character| character.is_whitespace())
+            .collect();
         self.record_edit();
         self.delete_active_region();
-        self.buffer.insert_char(self.cursor_char_idx(), '\n');
+        let insertion = format!("\n{indent}");
+        self.buffer.insert(self.cursor_char_idx(), &insertion);
         self.cursor_line += 1;
-        self.cursor_col = 0;
+        self.cursor_col = indent.chars().count();
+        self.mark_dirty();
+    }
+
+    fn insert_tab(&mut self) {
+        let width = self.tab_width - (self.cursor_col % self.tab_width);
+        self.record_edit();
+        self.delete_active_region();
+        self.buffer
+            .insert(self.cursor_char_idx(), &" ".repeat(width));
+        self.cursor_col += width;
         self.mark_dirty();
     }
 
@@ -941,6 +1132,93 @@ impl Editor {
         self.mark = None;
         self.status = "modified".to_string();
     }
+
+    fn annotation_for_line(&self, line: usize) -> Option<&Annotation> {
+        self.annotations
+            .iter()
+            .find(|annotation| annotation.line == line + 1)
+    }
+}
+
+fn reject_symlink(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "refusing to edit symlink {}; edit its target explicitly",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect output path {}", path.display()))
+        }
+    }
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("output path has no file name: {}", path.display()))?
+        .to_string_lossy();
+    let permissions = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+
+    let mut temporary = None;
+    for attempt in 0..100_u8 {
+        let candidate = parent.join(format!(
+            ".{name}.innards.{}.{attempt}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to create temporary file beside {}", path.display())
+                });
+            }
+        }
+    }
+
+    let (temporary_path, mut file) = temporary.ok_or_else(|| {
+        anyhow!(
+            "could not allocate a temporary file beside {}",
+            path.display()
+        )
+    })?;
+    let result = (|| -> Result<()> {
+        file.write_all(contents)
+            .with_context(|| format!("failed to write {}", temporary_path.display()))?;
+        file.flush()?;
+        file.sync_all()?;
+        if let Some(permissions) = permissions {
+            fs::set_permissions(&temporary_path, permissions)?;
+        }
+        drop(file);
+        fs::rename(&temporary_path, path).with_context(|| {
+            format!(
+                "failed to atomically replace {} with {}",
+                path.display(),
+                temporary_path.display()
+            )
+        })?;
+        if let Ok(directory) = File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
 }
 
 struct SyntaxHighlighter {
@@ -950,8 +1228,16 @@ struct SyntaxHighlighter {
 }
 
 impl SyntaxHighlighter {
-    fn new(path: Option<&PathBuf>) -> Result<Self> {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
+    fn new(requested: Option<&str>, path: Option<&Path>) -> Result<Self> {
+        let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
+        let trashtalk = SyntaxDefinition::load_from_str(
+            include_str!("../syntaxes/Trashtalk.sublime-syntax"),
+            true,
+            None,
+        )
+        .context("invalid bundled Trashtalk syntax definition")?;
+        builder.add(trashtalk);
+        let syntax_set = builder.build();
         let theme_set = ThemeSet::load_defaults();
         let theme = theme_set
             .themes
@@ -959,9 +1245,19 @@ impl SyntaxHighlighter {
             .or_else(|| theme_set.themes.values().next())
             .cloned()
             .ok_or_else(|| anyhow!("no syntect themes available"))?;
-        let syntax = path
-            .and_then(|path| syntax_set.find_syntax_for_file(path).ok().flatten())
-            .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+        let syntax = if is_trashtalk_syntax(requested, path) {
+            syntax_set
+                .find_syntax_by_name("Trashtalk")
+                .expect("bundled Trashtalk syntax should be present")
+        } else if let Some(requested) = requested {
+            syntax_set
+                .find_syntax_by_token(requested)
+                .or_else(|| syntax_set.find_syntax_by_name(requested))
+                .ok_or_else(|| anyhow!("unknown syntax: {requested}"))?
+        } else {
+            path.and_then(|path| syntax_set.find_syntax_for_file(path).ok().flatten())
+                .unwrap_or_else(|| syntax_set.find_syntax_plain_text())
+        };
         let syntax_name = syntax.name.clone();
 
         Ok(Self {
@@ -978,8 +1274,18 @@ impl SyntaxHighlighter {
     }
 }
 
+fn is_trashtalk_syntax(requested: Option<&str>, path: Option<&Path>) -> bool {
+    requested.is_some_and(|name| {
+        name.eq_ignore_ascii_case("trashtalk") || name.eq_ignore_ascii_case("trash")
+    }) || requested.is_none()
+        && path.is_some_and(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "trash")
+        })
+}
+
 fn run_editor(
-    terminal: &mut TerminalGuard,
+    terminal: &mut InlineTerminal,
     app: &mut Editor,
     syntax: &SyntaxHighlighter,
     mode: Mode,
@@ -1012,16 +1318,14 @@ fn run_editor(
                 }
             }
         }
-        terminal
-            .terminal
-            .draw(|frame| render::draw(frame, app, syntax, mode))?;
+        terminal.draw(|frame| render::draw(frame, app, syntax, mode))?;
     }
 }
 
 fn handle_key(
     app: &mut Editor,
     key: KeyEvent,
-    terminal: &mut TerminalGuard,
+    terminal: &mut InlineTerminal,
     mode: Mode,
 ) -> Result<Option<Outcome>> {
     if app.ctrl_x_pending {
@@ -1129,11 +1433,7 @@ fn handle_key(
         KeyCode::Backspace if mode.is_editable() => app.backspace(),
         KeyCode::Delete if mode.is_editable() => app.delete_char(),
         KeyCode::Enter if mode.is_editable() => app.insert_newline(),
-        KeyCode::Tab if mode.is_editable() => {
-            for _ in 0..4 {
-                app.insert_char(' ');
-            }
-        }
+        KeyCode::Tab if mode.is_editable() => app.insert_tab(),
         KeyCode::Char(ch)
             if mode.is_editable()
                 && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
@@ -1204,7 +1504,7 @@ fn handle_search_key(app: &mut Editor, key: KeyEvent) -> Result<Option<Outcome>>
 
 fn resize_inline_editor(
     app: &mut Editor,
-    terminal: &mut TerminalGuard,
+    terminal: &mut InlineTerminal,
     requested_height: u16,
 ) -> Result<()> {
     let max_height = size().map(|(_, rows)| rows).unwrap_or(app.height);
@@ -1354,11 +1654,40 @@ fn find_in_line_reverse(line: &str, query: &str, end_col: usize) -> Option<usize
 mod tests {
     use super::*;
 
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(test_name: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "innards-unit-{test_name}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn editor_with(text: &str) -> Editor {
         Editor {
             path: Some(PathBuf::from("test.txt")),
             display_path: "test.txt".to_string(),
             initial_content: text.to_string(),
+            expected_disk_state: DiskState::Present(text.to_string()),
+            conflict_confirmation: None,
             buffer: Rope::from_str(text),
             cursor_line: 0,
             cursor_col: 0,
@@ -1377,6 +1706,25 @@ mod tests {
             redo_stack: Vec::new(),
             edit_count: 0,
             save_count: 0,
+            tab_width: DEFAULT_TAB_WIDTH,
+            annotations: Vec::new(),
+        }
+    }
+
+    fn cli_args() -> CliArgs {
+        CliArgs {
+            path: None,
+            stdin: true,
+            output: None,
+            height: DEFAULT_HEIGHT,
+            line: None,
+            column: None,
+            title: None,
+            status: None,
+            tab_width: None,
+            syntax: None,
+            annotations: None,
+            result_json: true,
         }
     }
 
@@ -1389,6 +1737,28 @@ mod tests {
 
         assert_eq!(editor.buffer.to_string(), "abcdef");
         assert_eq!((editor.cursor_line, editor.cursor_col), (0, 3));
+    }
+
+    #[test]
+    fn enter_copies_current_indentation() {
+        let mut editor = editor_with("  alpha");
+        editor.cursor_col = 7;
+
+        editor.insert_newline();
+
+        assert_eq!(editor.buffer.to_string(), "  alpha\n  ");
+        assert_eq!((editor.cursor_line, editor.cursor_col), (1, 2));
+    }
+
+    #[test]
+    fn tab_advances_to_configured_stop_in_one_edit() {
+        let mut editor = editor_with("alpha");
+        editor.tab_width = 2;
+
+        editor.insert_tab();
+
+        assert_eq!(editor.buffer.to_string(), "  alpha");
+        assert_eq!(editor.edit_count, 1);
     }
 
     #[test]
@@ -1671,38 +2041,127 @@ mod tests {
 
     #[test]
     fn config_accepts_stdin_for_inpage() {
-        let config = Config::parse(
-            ["--stdin".to_string(), "--result-json".to_string()].into_iter(),
-            Mode::View,
-        )
-        .unwrap();
+        let invocation = cli_args().into_invocation(Mode::View).unwrap();
 
-        assert_eq!(config.path, None);
-        assert!(config.result_json);
+        assert_eq!(invocation.config.input_path, None);
+        assert!(invocation.result_json);
     }
 
     #[test]
     fn config_rejects_stdin_for_inmacs_until_output_is_supported() {
-        let error = Config::parse(["--stdin".to_string()].into_iter(), Mode::Edit).unwrap_err();
+        let error = cli_args().into_invocation(Mode::Edit).unwrap_err();
 
-        assert!(error.to_string().contains("explicit output destination"));
+        assert!(error.to_string().contains("requires --output"));
+    }
+
+    #[test]
+    fn config_accepts_stdin_editor_with_explicit_output() {
+        let mut args = cli_args();
+        args.output = Some(PathBuf::from("result.trash"));
+        args.syntax = Some("trashtalk".to_string());
+
+        let invocation = args.into_invocation(Mode::Edit).unwrap();
+
+        assert_eq!(
+            invocation.config.output_path,
+            Some(PathBuf::from("result.trash"))
+        );
+        assert_eq!(invocation.config.tab_width, 2);
+    }
+
+    #[test]
+    fn plus_line_argument_is_preserved_through_clap_normalization() {
+        let normalized = normalize_plus_line_args(
+            ["inpage", "+12", "source.trash"].map(std::ffi::OsString::from),
+        );
+
+        assert_eq!(
+            normalized,
+            ["inpage", "--line", "12", "source.trash"].map(std::ffi::OsString::from)
+        );
+    }
+
+    #[test]
+    fn annotation_document_requires_supported_schema() {
+        let scratch = ScratchDir::new("annotations");
+        let path = scratch.join("annotations.json");
+        fs::write(
+            &path,
+            r#"{"schema_version":1,"annotations":[{"line":3,"severity":"error","message":"expected ]"}]}"#,
+        )
+        .unwrap();
+
+        let document = AnnotationDocument::read(&path).unwrap();
+
+        assert_eq!(document.annotations[0].column, 1);
+        assert_eq!(document.annotations[0].line, 3);
+    }
+
+    #[test]
+    fn trash_extension_selects_bundled_trashtalk_syntax() {
+        let highlighter = SyntaxHighlighter::new(None, Some(Path::new("Counter.trash"))).unwrap();
+        let config = Config::for_path(Mode::Edit, "Counter.trash");
+
+        assert_eq!(highlighter.syntax_name, "Trashtalk");
+        assert_eq!(config.tab_width, 2);
+    }
+
+    #[test]
+    fn save_requires_confirmation_after_external_change() {
+        let scratch = ScratchDir::new("conflict");
+        let path = scratch.join("source.trash");
+        fs::write(&path, "alpha\n").unwrap();
+        let config = Config::for_path(Mode::Edit, &path);
+        let mut editor = Editor::open(&config).unwrap();
+        editor.insert_char('x');
+        fs::write(&path, "external\n").unwrap();
+
+        assert!(!editor.save().unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+        assert!(editor.status.contains("again to overwrite"));
+
+        assert!(editor.save().unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "xalpha\n");
     }
 
     #[cfg(unix)]
     #[test]
-    fn cursor_position_response_is_converted_to_zero_based_coordinates() {
+    fn atomic_save_preserves_target_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchDir::new("permissions");
+        let path = scratch.join("source.trash");
+        fs::write(&path, "alpha\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let config = Config::for_path(Mode::Edit, &path);
+        let mut editor = Editor::open(&config).unwrap();
+        editor.insert_char('x');
+
+        assert!(editor.save().unwrap());
+
         assert_eq!(
-            parse_cursor_position(b"\x1b[12;34R").unwrap(),
-            Position::new(33, 11)
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn cursor_position_response_rejects_zero_coordinates() {
-        let error = parse_cursor_position(b"\x1b[0;1R").unwrap_err();
+    fn editable_symlink_is_rejected_without_touching_target() {
+        use std::os::unix::fs::symlink;
 
-        assert!(error.to_string().contains("one-based"));
+        let scratch = ScratchDir::new("symlink");
+        let target = scratch.join("target.trash");
+        let link = scratch.join("link.trash");
+        fs::write(&target, "alpha\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = Editor::open(&Config::for_path(Mode::Edit, &link))
+            .err()
+            .expect("editing a symlink should fail");
+
+        assert!(error.to_string().contains("refusing to edit symlink"));
+        assert_eq!(fs::read_to_string(target).unwrap(), "alpha\n");
     }
 
     #[test]
@@ -1713,210 +2172,5 @@ mod tests {
     #[test]
     fn resize_anchor_preserves_bottom_when_shrinking() {
         assert_eq!(resize_anchor_row(8, 16, 12, 24), 12);
-    }
-}
-
-fn install_termination_handlers() -> Result<Arc<AtomicBool>> {
-    let interrupted = Arc::new(AtomicBool::new(false));
-    for signal in TERM_SIGNALS {
-        flag::register(*signal, Arc::clone(&interrupted))?;
-    }
-    Ok(interrupted)
-}
-
-fn open_terminal_device() -> Result<File> {
-    #[cfg(unix)]
-    let path = "/dev/tty";
-    #[cfg(windows)]
-    let path = "CONOUT$";
-
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("failed to open terminal device {path}"))
-}
-
-struct TtyBackend {
-    inner: CrosstermBackend<File>,
-    cursor_position: Position,
-}
-
-impl Backend for TtyBackend {
-    type Error = io::Error;
-
-    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
-    where
-        I: Iterator<Item = (u16, u16, &'a Cell)>,
-    {
-        self.inner.draw(content)
-    }
-
-    fn append_lines(&mut self, n: u16) -> io::Result<()> {
-        self.inner.append_lines(n)
-    }
-
-    fn hide_cursor(&mut self) -> io::Result<()> {
-        self.inner.hide_cursor()
-    }
-
-    fn show_cursor(&mut self) -> io::Result<()> {
-        self.inner.show_cursor()
-    }
-
-    fn get_cursor_position(&mut self) -> io::Result<Position> {
-        Ok(self.cursor_position)
-    }
-
-    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
-        let position = position.into();
-        self.inner.set_cursor_position(position)?;
-        self.cursor_position = position;
-        Ok(())
-    }
-
-    fn clear(&mut self) -> io::Result<()> {
-        self.inner.clear()
-    }
-
-    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
-        self.inner.clear_region(clear_type)
-    }
-
-    fn size(&self) -> io::Result<Size> {
-        self.inner.size()
-    }
-
-    fn window_size(&mut self) -> io::Result<WindowSize> {
-        self.inner.window_size()
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Backend::flush(&mut self.inner)
-    }
-}
-
-struct TerminalGuard {
-    terminal: Terminal<TtyBackend>,
-    tty: File,
-}
-
-impl TerminalGuard {
-    fn enter(height: u16) -> Result<Self> {
-        enable_raw_mode()?;
-        let tty = match open_terminal_device() {
-            Ok(tty) => tty,
-            Err(err) => {
-                let _ = disable_raw_mode();
-                return Err(err);
-            }
-        };
-        let terminal = match Self::new_terminal(&tty, height) {
-            Ok(terminal) => terminal,
-            Err(err) => {
-                let _ = disable_raw_mode();
-                return Err(err);
-            }
-        };
-        Ok(Self { terminal, tty })
-    }
-
-    fn new_terminal(tty: &File, height: u16) -> Result<Terminal<TtyBackend>> {
-        let mut terminal_io = tty.try_clone()?;
-        let cursor_position = query_cursor_position(&mut terminal_io)?;
-        let backend = TtyBackend {
-            inner: CrosstermBackend::new(terminal_io),
-            cursor_position,
-        };
-        let terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(height.max(MIN_HEIGHT)),
-            },
-        )?;
-        Ok(terminal)
-    }
-
-    fn resize(&mut self, height: u16, anchor_y: u16) -> Result<()> {
-        self.terminal.clear()?;
-        self.tty.execute(MoveTo(0, anchor_y))?;
-        self.terminal = Self::new_terminal(&self.tty, height)?;
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn query_cursor_position(tty: &mut File) -> Result<Position> {
-    tty.write_all(b"\x1b[6n")?;
-    tty.flush()?;
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut response = Vec::with_capacity(16);
-    while Instant::now() < deadline && response.len() < 64 {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-        let mut descriptor = libc::pollfd {
-            fd: tty.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: descriptor points to one initialized pollfd for the duration
-        // of the call, and tty remains open throughout the loop.
-        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
-        if ready == -1 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error).context("failed while waiting for cursor position");
-        }
-        if ready == 0 {
-            break;
-        }
-
-        let mut byte = [0_u8; 1];
-        tty.read_exact(&mut byte)?;
-        response.push(byte[0]);
-        if byte[0] == b'R' {
-            return parse_cursor_position(&response);
-        }
-    }
-
-    Err(anyhow!("terminal did not report its cursor position"))
-}
-
-#[cfg(unix)]
-fn parse_cursor_position(response: &[u8]) -> Result<Position> {
-    let response = std::str::from_utf8(response).context("cursor position was not UTF-8")?;
-    let start = response
-        .rfind("\x1b[")
-        .ok_or_else(|| anyhow!("cursor position response had no CSI prefix"))?;
-    let coordinates = response[start + 2..]
-        .strip_suffix('R')
-        .ok_or_else(|| anyhow!("cursor position response had no terminator"))?;
-    let (row, column) = coordinates
-        .split_once(';')
-        .ok_or_else(|| anyhow!("cursor position response had no separator"))?;
-    let row = row.parse::<u16>().context("invalid cursor row")?;
-    let column = column.parse::<u16>().context("invalid cursor column")?;
-    if row == 0 || column == 0 {
-        return Err(anyhow!("cursor position must be one-based"));
-    }
-    Ok(Position::new(column - 1, row - 1))
-}
-
-#[cfg(windows)]
-fn query_cursor_position(_tty: &mut File) -> Result<Position> {
-    crossterm::cursor::position()
-        .map(|(x, y)| Position::new(x, y))
-        .map_err(Into::into)
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = self.terminal.clear();
-        let _ = disable_raw_mode();
-        let _ = self.terminal.show_cursor();
-        let _ = self.tty.flush();
     }
 }

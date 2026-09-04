@@ -1,0 +1,56 @@
+%YAML 1.2
+---
+name: Trashtalk
+file_extensions:
+  - trash
+scope: source.trashtalk
+contexts:
+  main:
+    - match: '#.*$'
+      scope: comment.line.number-sign.trashtalk
+    - match: "'''"
+      push: triple-single-quoted-string
+    - match: '\"\"\"'
+      push: triple-double-quoted-string
+    - match: "'"
+      push: single-quoted-string
+    - match: '\"'
+      push: double-quoted-string
+    - match: '\b(package|import|subclass|include|instanceVars|classInstanceVars|method|classMethod|rawMethod|rawClassMethod|testMethod|rawTestMethod|pragma):'
+      scope: keyword.declaration.trashtalk
+    - match: '\b(ifTrue|ifFalse|ifNil|ifNotNil|whileTrue|whileFalse|timesRepeat|do|collect|select|detect|inject|into):'
+      scope: keyword.control.trashtalk
+    - match: '\b(self|super|true|false|nil)\b'
+      scope: constant.language.trashtalk
+    - match: '@'
+      scope: keyword.operator.message-send.trashtalk
+    - match: '\^'
+      scope: keyword.control.return.trashtalk
+    - match: ':='
+      scope: keyword.operator.assignment.trashtalk
+    - match: '-?[0-9]+(?:\.[0-9]+)?'
+      scope: constant.numeric.trashtalk
+
+  single-quoted-string:
+    - meta_scope: string.quoted.single.trashtalk
+    - match: "''"
+      scope: constant.character.escape.trashtalk
+    - match: "'"
+      pop: true
+
+  double-quoted-string:
+    - meta_scope: string.quoted.double.trashtalk
+    - match: '\\\\.'
+      scope: constant.character.escape.trashtalk
+    - match: '\"'
+      pop: true
+
+  triple-single-quoted-string:
+    - meta_scope: string.quoted.triple.trashtalk
+    - match: "'''"
+      pop: true
+
+  triple-double-quoted-string:
+    - meta_scope: string.quoted.triple.trashtalk
+    - match: '\"\"\"'
+      pop: true

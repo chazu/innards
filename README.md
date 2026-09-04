@@ -18,8 +18,13 @@ Quick, and get out of your way.
 - `inmacs`: inline editor with Emacs-like navigation and editing keys.
 - `inpage`: read-only inline pager with the same movement/search surface as
   `inmacs`.
+- `inpick`: generic JSON Lines picker with source previews and structured
+  selection results.
+- `ininspect`: navigable JSON object tree with typed leaf-edit proposals.
+- `indiff`: presentation-only unified-diff reviewer with explicit structured
+  accept, reject, and cancel outcomes.
 
-All three use ratatui with an inline terminal viewport, so they open below the
+All six use ratatui with an inline terminal viewport, so they open below the
 current prompt instead of taking over the whole screen.
 
 ## Build
@@ -132,6 +137,20 @@ inmacs +120 src/lib.rs
 inmacs --line 120 src/lib.rs
 ```
 
+Open at a line and column, override the presentation, or select a syntax:
+
+```sh
+inmacs --line 120 --column 8 --title 'Counter>>increment' \
+  --status 'Fix the compiler error' --syntax trashtalk src/Counter.trash
+```
+
+Stdin-backed editing requires an explicit output destination:
+
+```sh
+printf 'Counter subclass: Object\n' |
+  inmacs --stdin --output Counter.trash --result-json
+```
+
 Set the inline viewport height:
 
 ```sh
@@ -149,6 +168,29 @@ The process exits 0 after a save or an unchanged close, 3 when dirty edits are
 discarded, and 130 when cancelled with Ctrl-C or interrupted by a termination
 signal. The result distinguishes `saved`, `unchanged`, `discarded`, and
 `cancelled` outcomes.
+
+Pass a versioned annotation document to display diagnostics beside their source
+lines without inserting comments into the file:
+
+```json
+{
+  "schema_version": 1,
+  "annotations": [
+    {"line": 12, "column": 3, "severity": "error", "message": "expected ]"}
+  ]
+}
+```
+
+```sh
+inmacs --annotations diagnostics.json --syntax trashtalk Counter.trash
+```
+
+Saves use a flushed temporary file and atomic rename. Existing permission bits
+are retained. If the target changed after it was opened, the first save warns
+and a second consecutive Ctrl-X Ctrl-S confirms the overwrite. Editable
+symlinks are rejected; open their target explicitly. Because an atomic save
+replaces the inode, ownership may become the editor user's and extended
+attributes are not currently copied.
 
 Core keys:
 
@@ -177,13 +219,16 @@ Ctrl-Y            Yank
 Ctrl-K            Kill to end of line
 Ctrl-D/Delete     Delete character
 Backspace         Delete backward
+Enter             Insert newline and copy the current indentation
+Tab               Advance to the next configured tab stop
 Ctrl-/ Ctrl-_     Undo
 Ctrl-7            Undo
 Ctrl-?            Redo, where the terminal reports it distinctly
 ```
 
 `inmacs` uses `ropey` internally for text storage and `syntect` for syntax
-highlighting.
+highlighting. `.trash` files select the bundled Trashtalk syntax and a two-space
+tab width by default; `--tab-width` overrides it.
 
 ## inpage
 
@@ -205,14 +250,102 @@ result=$(printf 'one\ntwo\n' | inpage --stdin --result-json)
 ```
 
 `-` is an alias for `--stdin`. JSON output reports `closed` after a normal quit
-or `cancelled` after Ctrl-C or a termination signal. Stdin editing for `inmacs`
-is intentionally deferred until an explicit output destination is implemented.
+or `cancelled` after Ctrl-C or a termination signal. `inpage` also accepts the
+presentation, syntax, and annotation options described above.
 
 Additional pager quit keys:
 
 ```text
 Esc
 q
+```
+
+## inpick
+
+`inpick` accepts one versioned candidate record per line on stdin. Paths may be
+absolute or relative to `--root`; the selected file is previewed around its
+one-based line and column.
+
+```sh
+printf '%s\n' \
+  '{"schema_version":1,"id":"Array>>at:put:","path":"trash/Array.trash","line":49,"column":3,"label":"Array>>at:put:","kind":"instance_method","detail":"DSL"}' |
+  inpick --root "$HOME/.trashtalk" --title 'Trashtalk symbols' --result-json
+```
+
+The result is a single JSON object. Enter returns `selected` with the original
+candidate record and exit status 0. Esc, Ctrl-C, or a termination signal returns
+`cancelled` with no selection and exit status 130. The terminal UI writes only
+to the controlling terminal, leaving stdout clean for the result.
+
+Picker keys:
+
+```text
+Enter             Select the current record
+Esc, Ctrl-C       Cancel
+Up/Down           Move selection
+Ctrl-P/Ctrl-N     Move selection
+PageUp/PageDown   Move by larger steps
+Shift-Up/Down     Scroll the source preview
+Typing/Backspace  Filter across id, label, kind, detail, and path
+```
+
+Library consumers can provide candidates through the reusable
+`picker::Provider` interface; `StaticProvider` implements the JSONL-backed
+filter used by the command-line tool.
+
+## ininspect
+
+`ininspect` reads one versioned object record from stdin and renders its JSON
+state as an expandable tree. Runtime input and result data stay on stdin and
+stdout; interaction and rendering use `/dev/tty`.
+
+```sh
+printf '%s\n' \
+  '{"schema_version":1,"object_id":"counter_123","class_name":"Counter","data":{"value":42,"options":{"enabled":true}}}' |
+  ininspect --result-json
+```
+
+Normal viewing is presentation-only. Pressing `e` on a scalar opens an inline
+JSON-value editor. Enter returns a `proposed` result containing the typed path,
+old value, new value, and original data snapshot; `ininspect` never applies the
+change itself. The caller must validate the snapshot and proposal before
+mutation.
+
+```text
+Up/Down, j/k       Move through visible tree rows
+Enter, Space       Expand or collapse a container
+Right/Left, l/h    Expand or collapse a container
+e                  Edit a scalar as JSON and return a proposal
+q                  Close with a viewed outcome
+Esc, Ctrl-C        Cancel
+```
+
+`viewed` and `proposed` return status 0. Cancellation returns status 130. All
+outcomes are single schema-versioned JSON objects on stdout.
+
+## indiff
+
+`indiff` reads a unified diff from stdin and presents it without applying or
+otherwise modifying anything. Accepting is only a structured decision for the
+caller; the caller remains responsible for validating and applying the change.
+
+```sh
+result=$(git diff | indiff --result-json --title 'Review proposed change')
+```
+
+The result is one JSON object with schema version 1, an `accepted`, `rejected`,
+or `cancelled` outcome, and zero-based `accepted_hunks` and `rejected_hunks`
+arrays. Accepting at least one hunk returns status 0, rejecting every hunk
+returns 3, and Ctrl-C or a termination signal returns 130.
+
+```text
+a, y, Enter       Accept current hunk and advance
+r, n              Reject current hunk and advance
+A / R              Accept / reject every remaining hunk
+q, Esc             Reject every remaining hunk
+Ctrl-C            Cancel
+Up/Down, Ctrl-P/N Scroll one line
+PageUp/PageDown   Scroll ten lines
 ```
 
 ## Development
@@ -224,6 +357,9 @@ cargo fmt
 cargo check --bins
 cargo test --lib
 cargo test --test terminal_contract  # Unix PTY contract (requires Expect)
+cargo test --test picker_contract    # inpick PTY/result contract
+cargo test --test inspector_contract # ininspect PTY/result contract
+cargo test --test review_contract    # indiff PTY/result contract
 cargo build --bins
 ```
 
