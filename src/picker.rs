@@ -117,6 +117,7 @@ pub struct Config {
     pub height: u16,
     pub title: String,
     pub initial_query: String,
+    pub ctrl_d_action: Option<String>,
 }
 
 impl Config {
@@ -126,6 +127,7 @@ impl Config {
             height: DEFAULT_HEIGHT,
             title: "inpick".to_string(),
             initial_query: String::new(),
+            ctrl_d_action: None,
         }
     }
 }
@@ -151,6 +153,8 @@ pub struct PickerResult {
     pub schema_version: u8,
     pub outcome: Outcome,
     pub selection: Option<Candidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 pub fn write_result_json(result: &PickerResult) -> Result<()> {
@@ -192,9 +196,11 @@ pub fn run_with(provider: &impl Provider, config: Config) -> Result<PickerResult
         }
         match handle_key(&mut app, provider, key) {
             Action::Continue => {}
-            Action::Select(candidate) => {
+            Action::Select(candidate, action) => {
                 drop(terminal);
-                return Ok(app.result(Outcome::Selected, Some(candidate)));
+                let mut result = app.result(Outcome::Selected, Some(candidate));
+                result.action = action;
+                return Ok(result);
             }
             Action::Cancel => {
                 drop(terminal);
@@ -240,13 +246,14 @@ impl App {
             schema_version: 1,
             outcome,
             selection,
+            action: None,
         }
     }
 }
 
 enum Action {
     Continue,
-    Select(Candidate),
+    Select(Candidate, Option<String>),
     Cancel,
 }
 
@@ -258,7 +265,14 @@ fn handle_key(app: &mut App, provider: &impl Provider, key: KeyEvent) -> Action 
         }
         KeyCode::Enter => {
             if let Some(candidate) = app.selected().cloned() {
-                return Action::Select(candidate);
+                return Action::Select(candidate, None);
+            }
+        }
+        KeyCode::Char('d')
+            if key.modifiers == KeyModifiers::CONTROL && app.config.ctrl_d_action.is_some() =>
+        {
+            if let Some(candidate) = app.selected().cloned() {
+                return Action::Select(candidate, app.config.ctrl_d_action.clone());
             }
         }
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -349,9 +363,16 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     frame.render_stateful_widget(list, list_area, &mut state);
 
     draw_preview(frame, preview_area, app);
+    let action_hint = app
+        .config
+        .ctrl_d_action
+        .as_ref()
+        .map(|action| format!(" | ctrl-d {action}"))
+        .unwrap_or_default();
     let status = format!(
-        "{} match(es) | enter select | esc cancel | arrows move | shift-arrows preview",
-        app.matches.len()
+        "{} match(es) | enter select{} | esc cancel | arrows move | shift-arrows preview",
+        app.matches.len(),
+        action_hint
     );
     frame.render_widget(
         Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
@@ -498,5 +519,46 @@ mod tests {
         let error = read_json_lines(Cursor::new(record)).unwrap_err();
 
         assert!(error.to_string().contains("one-based"));
+    }
+
+    #[test]
+    fn control_d_action_requires_opt_in_and_a_match() {
+        let provider = StaticProvider::new(vec![candidate("message-1", "hello")]);
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let mut app = App::new(&provider, Config::new("."));
+        assert!(matches!(
+            handle_key(&mut app, &provider, key),
+            Action::Continue
+        ));
+        app.config.ctrl_d_action = Some("archive".into());
+        app.input = Input::from("no matches".to_string());
+        app.refresh(&provider);
+        assert!(matches!(
+            handle_key(&mut app, &provider, key),
+            Action::Continue
+        ));
+    }
+
+    #[test]
+    fn enter_does_not_request_the_optional_action() {
+        let provider = StaticProvider::new(vec![candidate("message-1", "hello")]);
+        let mut config = Config::new(".");
+        config.ctrl_d_action = Some("archive".into());
+        let mut app = App::new(&provider, config);
+        assert!(matches!(
+            handle_key(
+                &mut app,
+                &provider,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Action::Select(_, None)
+        ));
+        let result = app.result(Outcome::Cancelled, None);
+        assert!(
+            serde_json::to_value(result)
+                .unwrap()
+                .get("action")
+                .is_none()
+        );
     }
 }

@@ -25,6 +25,10 @@ struct Cli {
     #[arg(long, default_value = "")]
     query: String,
 
+    /// Return the highlighted candidate with this action when Ctrl-D is pressed.
+    #[arg(long)]
+    ctrl_d_action: Option<String>,
+
     /// Accepted for consistency with other Innards surfaces; output is always JSON.
     #[arg(long)]
     result_json: bool,
@@ -38,6 +42,7 @@ fn main() -> Result<ExitCode> {
     config.height = cli.height;
     config.title = cli.title;
     config.initial_query = cli.query;
+    config.ctrl_d_action = cli.ctrl_d_action;
     let result = run_with(&provider, config)?;
     let _ = cli.result_json;
     write_result_json(&result)?;

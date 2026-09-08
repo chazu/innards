@@ -262,6 +262,11 @@ q
 
 ## inpick
 
+Pass `--ctrl-d-action archive` to let Ctrl-D return the highlighted candidate
+with `"action":"archive"` in the selected result. The caller performs the
+action; inpick does not mutate records. Enter selects normally and Escape
+cancels. The optional action is shown in the footer.
+
 `inpick` accepts one versioned candidate record per line on stdin. Paths may be
 absolute or relative to `--root`; the selected file is previewed around its
 one-based line and column.

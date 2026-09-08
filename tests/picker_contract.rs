@@ -152,6 +152,59 @@ fn jsonl_picker_selects_filtered_keyword_method_with_preview_and_clean_stdout() 
 }
 
 #[test]
+fn ctrl_d_returns_archive_action_for_filtered_message() {
+    let (_scratch, _source, candidates, result, before, after) = fixture("archive");
+    let binary = Path::new(env!("CARGO_BIN_EXE_inpick"));
+    let script = r#"
+        log_user 1
+        set timeout 10
+        set binary $env(INNARDS_TEST_ARG_0)
+        set candidates $env(INNARDS_TEST_ARG_1)
+        set result $env(INNARDS_TEST_ARG_2)
+        set before $env(INNARDS_TEST_ARG_3)
+        set after $env(INNARDS_TEST_ARG_4)
+        set command [format {stty rows 24 columns 100; stty -g </dev/tty > %s; %s --query 'fromJson:cluster:' --ctrl-d-action archive --result-json < %s > %s; status=$?; stty -g </dev/tty > %s; exit "$status"} $before $binary $candidates $result $after]
+        spawn -noecho /bin/sh -c $command
+        expect -exact "\033\[6n"
+        send -- "\033\[1;1R"
+        after 100
+        send -- "\004"
+        expect {
+            eof {}
+            timeout {
+                set pid [exp_pid]
+                catch {exec /bin/kill -KILL -- -$pid}
+                catch {expect eof}
+                exit 97
+            }
+        }
+        set result [wait]
+        exit [lindex $result 3]
+    "#;
+
+    let output = run_expect(script, &[binary, &candidates, &result, &before, &after]);
+    assert!(
+        output.status.success(),
+        "expect failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("classMethod: fromJson: json cluster:"),
+        "preview did not render source: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let text = fs::read_to_string(&result).expect("read result");
+    assert_eq!(text.lines().count(), 1);
+    assert!(!text.contains('\u{1b}'));
+    let value: serde_json::Value = serde_json::from_str(&text).expect("parse result");
+    assert_eq!(value["outcome"], "selected");
+    assert_eq!(value["action"], "archive");
+    assert_eq!(value["selection"]["id"], "Kube::Pod>>fromJson:cluster:");
+    assert_terminal_mode_restored(&before, &after);
+}
+
+#[test]
 fn jsonl_picker_cancel_is_structured_and_restores_terminal() {
     let (_scratch, _source, candidates, result, before, after) = fixture("cancel");
     let binary = Path::new(env!("CARGO_BIN_EXE_inpick"));
