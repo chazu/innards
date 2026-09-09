@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::size;
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
@@ -191,6 +193,9 @@ pub fn run_with(config: Config) -> Result<RunResult> {
     let interrupted = termination_flag()?;
 
     let mut terminal = InlineTerminal::enter(config.height)?;
+    if config.mode == Mode::View {
+        terminal.enable_mouse_capture()?;
+    }
     terminal.draw(|frame| render::draw(frame, &mut app, &syntax, config.mode))?;
     let outcome = run_editor(&mut terminal, &mut app, &syntax, config.mode, &interrupted)?;
     drop(terminal);
@@ -650,6 +655,27 @@ impl Editor {
         } else if self.cursor_col >= self.scroll_x.saturating_add(text_width) {
             self.scroll_x = self.cursor_col.saturating_sub(text_width.saturating_sub(1));
         }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if mouse.row < self.last_drawn_top
+            || mouse.row >= self.last_drawn_top.saturating_add(self.last_drawn_height)
+        {
+            return;
+        }
+        let text_height = self.last_drawn_height.saturating_sub(3).max(1) as usize;
+        let max_scroll = self.line_count().saturating_sub(text_height);
+        self.scroll_y = match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_y.saturating_sub(3),
+            MouseEventKind::ScrollDown => self.scroll_y.saturating_add(3).min(max_scroll),
+            _ => return,
+        };
+        // Keep point visible so rendering and subsequent keyboard navigation
+        // continue from the scrolled viewport instead of snapping back.
+        self.cursor_line = self
+            .cursor_line
+            .clamp(self.scroll_y, self.scroll_y + text_height - 1);
+        self.clamp_cursor();
     }
 
     fn insert_char(&mut self, ch: char) {
@@ -1312,6 +1338,7 @@ fn run_editor(
                         return Ok(outcome);
                     }
                 }
+                Ok(Event::Mouse(mouse)) if mode == Mode::View => app.handle_mouse(mouse),
                 Ok(_) => {}
                 Err(err) => {
                     app.status = format!("input error: {err}");
@@ -1725,6 +1752,62 @@ mod tests {
             syntax: None,
             annotations: None,
             result_json: true,
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_viewport_and_clamps_at_buffer_edges() {
+        let mut editor = editor_with(
+            &(0..40)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 5,
+            row: 2,
+            modifiers: KeyModifiers::empty(),
+        };
+        editor.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        editor.ensure_cursor_visible(13, 60);
+        assert_eq!(editor.scroll_y, 3);
+        assert_eq!(editor.cursor_line, 3);
+        for _ in 0..100 {
+            editor.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        }
+        assert_eq!(editor.scroll_y, 27);
+        for _ in 0..100 {
+            editor.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        }
+        editor.ensure_cursor_visible(13, 60);
+        assert_eq!(editor.scroll_y, 0);
+        assert!(!editor.dirty);
+        assert_eq!(editor.edit_count, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_ignores_rows_outside_inline_pager_and_short_buffers() {
+        let mut editor = editor_with("one\ntwo");
+        editor.last_drawn_top = 5;
+        for row in [0, 5, 20, 21] {
+            editor.handle_mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 5,
+                row,
+                modifiers: KeyModifiers::empty(),
+            });
+            assert_eq!(editor.scroll_y, 0);
+        }
+        editor.buffer = Rope::from_str(&"line\n".repeat(40));
+        for row in [4, 21] {
+            editor.handle_mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 5,
+                row,
+                modifiers: KeyModifiers::empty(),
+            });
+            assert_eq!(editor.scroll_y, 0);
         }
     }
 

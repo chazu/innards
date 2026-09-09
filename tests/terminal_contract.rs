@@ -403,3 +403,79 @@ fn termination_signal_produces_a_clean_cancellation_result() {
     assert_eq!(result["outcome"], "cancelled");
     assert_eq!(result["path"], source_path.display().to_string());
 }
+
+#[test]
+fn pager_mouse_wheel_uses_tty_and_releases_capture_on_exit() {
+    for exit_action in ["q", "ctrl-c", "sigterm"] {
+        let scratch = ScratchDir::new(exit_action);
+        let source_path = scratch.join("source.txt");
+        let result_path = scratch.join("result.json");
+        let action_path = Path::new(exit_action);
+        fs::write(
+            &source_path,
+            (1..=60)
+                .map(|n| {
+                    format!(
+                        "{}\n",
+                        char::from(b'A' + ((n - 1) % 26) as u8)
+                            .to_string()
+                            .repeat(12)
+                    )
+                })
+                .collect::<String>(),
+        )
+        .unwrap();
+        let binary = Path::new(env!("CARGO_BIN_EXE_inpage"));
+        let script = r#"
+            log_user 1
+            set timeout 10
+            set command [format {stty rows 24 columns 80 </dev/tty; exec %s --height 8 --result-json %s > %s} $env(INNARDS_TEST_ARG_0) $env(INNARDS_TEST_ARG_1) $env(INNARDS_TEST_ARG_2)]
+            spawn -noecho /bin/sh -c $command
+            expect -exact "\033\[6n"
+            send -- "\033\[1;1R"
+            expect {
+                -exact "\033\[?1006h" {}
+                timeout { exit 96 }
+            }
+            after 100
+            # SGR wheel down, inside the pager. Scroll from rows 1-5 to 4-8.
+            send -- "\033\[<65;6;3M"
+            expect {
+                -exact "HHHHHHHHHHHH" {}
+                timeout { exit 95 }
+            }
+            after 100
+            switch -- $env(INNARDS_TEST_ARG_3) {
+                q { send -- "q" }
+                ctrl-c { send -- "\003" }
+                sigterm { exec kill -TERM [exp_pid] }
+            }
+            expect {
+                -exact "\033\[?1000l" {}
+                timeout { exit 94 }
+            }
+            expect {
+                eof {}
+                timeout {
+                    set pid [exp_pid]
+                    catch {exec /bin/kill -KILL -- -$pid}
+                    exit 97
+                }
+            }
+            set result [wait]
+            exit [lindex $result 3]
+        "#;
+        let output = run_expect(script, &[binary, &source_path, &result_path, action_path]);
+        let expected_status = if exit_action == "q" { 0 } else { 130 };
+        assert_eq!(
+            output.status.code(),
+            Some(expected_status),
+            "{exit_action}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = parse_single_json_line(&result_path);
+        assert_eq!(result["cursor"]["line"], 4);
+        assert_eq!(result["changed"], false);
+    }
+}

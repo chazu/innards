@@ -10,6 +10,7 @@ use std::os::fd::AsRawFd;
 use anyhow::{Context, Result, anyhow};
 use crossterm::ExecutableCommand;
 use crossterm::cursor::MoveTo;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::Cell;
@@ -26,6 +27,7 @@ const MIN_HEIGHT: u16 = 5;
 pub struct InlineTerminal {
     terminal: Terminal<TtyBackend>,
     tty: File,
+    mouse_capture: bool,
 }
 
 impl InlineTerminal {
@@ -45,7 +47,18 @@ impl InlineTerminal {
                 return Err(err);
             }
         };
-        Ok(Self { terminal, tty })
+        Ok(Self {
+            terminal,
+            tty,
+            mouse_capture: false,
+        })
+    }
+
+    pub fn enable_mouse_capture(&mut self) -> Result<()> {
+        // Set this first so Drop also cleans up a partially written command.
+        self.mouse_capture = true;
+        self.tty.execute(EnableMouseCapture)?;
+        Ok(())
     }
 
     pub fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> Result<()> {
@@ -79,6 +92,9 @@ impl InlineTerminal {
 
 impl Drop for InlineTerminal {
     fn drop(&mut self) {
+        if self.mouse_capture {
+            let _ = self.tty.execute(DisableMouseCapture);
+        }
         let _ = self.terminal.clear();
         let _ = disable_raw_mode();
         let _ = self.terminal.show_cursor();

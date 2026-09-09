@@ -241,6 +241,9 @@ inpage +120 src/lib.rs
 
 `inpage` accepts the same `--height`, `--line`, and `+LINE` arguments as
 `inmacs`. Editing keys are disabled, but movement and search keys are shared.
+The mouse wheel scrolls three lines per tick when the pointer is over the pager.
+Mouse capture is released when the pager exits. To select text with the mouse,
+use your terminal's mouse-reporting override (usually Shift-drag).
 
 It can also read piped content while keeping terminal drawing separate from
 stdout:
@@ -281,6 +284,22 @@ The result is a single JSON object. Enter returns `selected` with the original
 candidate record and exit status 0. Esc, Ctrl-C, or a termination signal returns
 `cancelled` with no selection and exit status 130. The terminal UI writes only
 to the controlling terminal, leaving stdout clean for the result.
+
+For messages and other records whose path is only a preview source, add an
+optional `display` object:
+
+```json
+"display": {
+  "prefix": "● Gusgus  14:32",
+  "preview_title": "Message",
+  "search_text": "full sender address and message body"
+}
+```
+
+These records show the prefix and label in a compact row, hide the path and
+kind, and give more space to the preview. Prefix and search text participate
+in filtering; selection still returns the complete original record. Omit
+`display` for the existing source-navigation layout.
 
 Picker keys:
 

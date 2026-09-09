@@ -32,8 +32,22 @@ pub struct Candidate {
     pub kind: String,
     #[serde(default)]
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<CandidateDisplay>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Optional compact presentation for records whose path is only a preview source.
+/// Identity and selection still use the original candidate fields.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CandidateDisplay {
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub preview_title: String,
+    #[serde(default)]
+    pub search_text: String,
 }
 
 impl Candidate {
@@ -96,12 +110,17 @@ impl Provider for StaticProvider {
             .iter()
             .filter(|candidate| {
                 let searchable = format!(
-                    "{} {} {} {} {}",
+                    "{} {} {} {} {} {} {}",
                     candidate.id,
                     candidate.label,
                     candidate.kind,
                     candidate.detail,
-                    candidate.path.display()
+                    candidate.path.display(),
+                    candidate.display.as_ref().map_or("", |d| d.prefix.as_str()),
+                    candidate
+                        .display
+                        .as_ref()
+                        .map_or("", |d| d.search_text.as_str())
                 )
                 .to_lowercase();
                 terms.iter().all(|term| searchable.contains(term))
@@ -331,8 +350,16 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    let [list_area, preview_area] =
-        Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(body_area);
+    let list_percent = if app.selected().is_some_and(|c| c.display.is_some()) {
+        40
+    } else {
+        55
+    };
+    let [list_area, preview_area] = Layout::vertical([
+        Constraint::Percentage(list_percent),
+        Constraint::Percentage(100 - list_percent),
+    ])
+    .areas(body_area);
 
     let query = Paragraph::new(app.input.value()).block(
         Block::default()
@@ -381,6 +408,13 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn candidate_item(candidate: &Candidate) -> ListItem<'_> {
+    if let Some(display) = &candidate.display {
+        return ListItem::new(Line::from(vec![
+            Span::styled(display.prefix.as_str(), Style::default().fg(Color::Cyan)),
+            Span::raw("  "),
+            Span::styled(candidate.label.as_str(), Style::default().fg(Color::White)),
+        ]));
+    }
     ListItem::new(Line::from(vec![
         Span::styled(
             format!("{:<12}", candidate.kind),
@@ -410,7 +444,17 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
     let path = resolve_path(&app.config.root, &candidate.path);
-    let title = format!(" Preview {}:{} ", candidate.path.display(), candidate.line);
+    let title = match &candidate.display {
+        Some(display) => format!(
+            " {} ",
+            if display.preview_title.is_empty() {
+                "Preview"
+            } else {
+                &display.preview_title
+            }
+        ),
+        None => format!(" Preview {}:{} ", candidate.path.display(), candidate.line),
+    };
     let lines = preview_lines(&path, candidate.line, area, app.preview_scroll);
     frame.render_widget(
         Paragraph::new(lines)
@@ -481,6 +525,7 @@ mod tests {
             label: label.to_string(),
             kind: "method".to_string(),
             detail: "instance method".to_string(),
+            display: None,
             extra: BTreeMap::new(),
         }
     }
@@ -519,6 +564,41 @@ mod tests {
         let error = read_json_lines(Cursor::new(record)).unwrap_err();
 
         assert!(error.to_string().contains("one-based"));
+    }
+
+    #[test]
+    fn compact_display_keeps_identity_and_hidden_text_searchable() {
+        let record = r#"{"schema_version":1,"id":"message_123","path":"message_123.txt","line":1,"column":1,"label":"Tests pass","kind":"result","display":{"prefix":"● Gusgus  14:32","preview_title":"Message","search_text":"session:agentsession_456 second paragraph"}}"#;
+        let candidates = read_json_lines(Cursor::new(record)).unwrap();
+        let provider = StaticProvider::new(candidates.clone());
+        assert_eq!(provider.search("Gusgus paragraph")[0].id, "message_123");
+        assert_eq!(provider.search("agentsession_456")[0], candidates[0]);
+        assert!(provider.search("unrelated").is_empty());
+        let encoded = serde_json::to_value(&candidates[0]).unwrap();
+        assert_eq!(encoded["display"]["preview_title"], "Message");
+    }
+
+    #[test]
+    fn compact_display_hides_file_machinery_and_gives_preview_more_space() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut message = candidate("message_123", "Tests pass");
+        message.path = PathBuf::from("message_123.txt");
+        message.kind = "result".into();
+        message.display = Some(CandidateDisplay {
+            prefix: "● Gusgus  14:32".into(),
+            preview_title: "Message".into(),
+            search_text: String::new(),
+        });
+        let provider = StaticProvider::new(vec![message]);
+        let mut app = App::new(&provider, Config::new("."));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        assert!(row(4).contains("● Gusgus  14:32  Tests pass"));
+        assert!(!row(4).contains("message_123.txt"));
+        assert!(row(9).contains("Message"));
+        assert!(!row(9).contains("message_123.txt"));
     }
 
     #[test]

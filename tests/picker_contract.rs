@@ -243,3 +243,67 @@ fn jsonl_picker_cancel_is_structured_and_restores_terminal() {
     assert!(value["selection"].is_null());
     assert_terminal_mode_restored(&before, &after);
 }
+
+#[test]
+fn compact_message_display_hides_paths_and_preserves_selection_contract() {
+    let (_scratch, source, candidates, result, before, after) = fixture("compact-message");
+    fs::write(
+        &source,
+        "Gusgus → You  ·  Today 14:32\nTests pass\n\nChanges are ready for review.\n",
+    )
+    .unwrap();
+    let candidate = serde_json::json!({
+        "schema_version":1,"id":"message_unique_id","path":source,"line":1,"column":1,
+        "label":"Tests pass","kind":"result","detail":"unread",
+        "display":{"prefix":"● Gusgus  14:32","preview_title":"Message","search_text":"session:agentsession_456 regression"}
+    });
+    fs::write(&candidates, format!("{candidate}\n")).unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_inpick"));
+    let script = r#"
+        log_user 1
+        set timeout 10
+        set command [format {stty rows 24 columns 100; stty -g </dev/tty > %s; %s --query regression --ctrl-d-action archive --result-json < %s > %s; status=$?; stty -g </dev/tty > %s; exit "$status"} $env(INNARDS_TEST_ARG_3) $env(INNARDS_TEST_ARG_0) $env(INNARDS_TEST_ARG_1) $env(INNARDS_TEST_ARG_2) $env(INNARDS_TEST_ARG_4)]
+        spawn -noecho /bin/sh -c $command
+        expect -exact "\033\[6n"
+        send -- "\033\[1;1R"
+        expect {
+            -exact "Changes are ready for review." {}
+            timeout { exit 96 }
+        }
+        send -- "\004"
+        expect {
+            eof {}
+            timeout {
+                set pid [exp_pid]
+                catch {exec /bin/kill -KILL -- -$pid}
+                exit 97
+            }
+        }
+        set result [wait]
+        exit [lindex $result 3]
+    "#;
+    let output = run_expect(script, &[binary, &candidates, &result, &before, &after]);
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let screen = String::from_utf8_lossy(&output.stdout);
+    assert!(screen.contains("Gusgus"));
+    assert!(
+        !screen.contains("Pod.trash"),
+        "preview source path should be hidden"
+    );
+    assert!(
+        !screen.contains("message_unique_id"),
+        "message id should be hidden"
+    );
+    let text = fs::read_to_string(&result).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(!text.contains('\u{1b}'));
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["selection"], candidate);
+    assert_eq!(value["action"], "archive");
+    assert_terminal_mode_restored(&before, &after);
+}
