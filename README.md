@@ -23,9 +23,17 @@ Quick, and get out of your way.
 - `ininspect`: navigable JSON object tree with typed leaf-edit proposals.
 - `indiff`: presentation-only unified-diff reviewer with explicit structured
   accept, reject, and cancel outcomes.
+- `inagent`: live agent conversation with backlog, a message composer, search,
+  and explicit session-control intents over a duplex JSONL protocol.
 
-All six use ratatui with an inline terminal viewport, so they open below the
+All seven use ratatui with an inline terminal viewport, so they open below the
 current prompt instead of taking over the whole screen.
+
+While any view is open, use **Ctrl-X, then ^** (`C-x ^`) to grow it by one
+terminal row, or **Ctrl-X, then -** (`C-x -`) to shrink it by one row.
+Alt-Down and Alt-Up are equivalent. Resizing stops at the view's minimum
+usable height and the terminal's full height; it preserves the current
+selection, search, and edits. The size applies to the currently open view.
 
 ## Build
 
@@ -34,6 +42,36 @@ cargo build --release --bins
 ```
 
 The binaries will be under `target/release/`.
+
+## inagent
+
+The caller streams version-1 `snapshot` and `ack` records to stdin. `inagent`
+renders through `/dev/tty` and flushes explicit intents to stdout; it owns no
+agent process, database, or delivery policy. In Trashtalk, open it with
+`@ AgentSession browse` → **Attach to conversation**, or `@ "$session" focus`.
+
+Long lines wrap to the composer width and scroll to keep the cursor visible.
+Enter inserts a newline; **C-c C-c** sends the draft. **Tab** switches between
+composer and transcript. **C-n/C-p**, **C-v/M-v**, **C-s/C-r**, and **M-</M->**
+navigate, search, load earlier history, or follow live output. **M-x** opens
+the command menu. **C-x C-c** detaches, asking before discarding a draft.
+Ctrl-X resize chords and Alt-Up/Down work as in the other applets.
+
+The applet preserves drafts until send acknowledgement, keeps a scrolled
+transcript anchored as updates arrive, and emits read intents only for visible
+message entries. Stop confirmation captures the displayed run ID. Detach and
+signals never emit a stop intent. A disconnected bridge leaves the loaded
+backlog available and disables sending.
+
+```json
+{"schema_version":1,"type":"snapshot","session":{"id":"s","title":"Gusgus","workspace":"/repo","profile":"jcode","lifecycle":"open","activity":"running","run_id":"r","pending":0},"entries":[{"id":"entry-1","kind":"assistant","title":"Assistant","text":"Working on the parser."}],"has_earlier":false,"window":400}
+{"schema_version":1,"type":"ack","request_id":1,"ok":true,"message":"Message sent"}
+```
+
+Intents contain `schema_version`, a connection-local numeric `request_id`, and
+`intent`: `send_message` (+ `body`), `mark_viewed` (+ `message_ids`),
+`load_older`, `pause_session`, `resume_session`, `interrupt_run` (+ `run_id`), or
+`dismiss`. The caller validates every intent against current domain state.
 
 ## Install
 
@@ -197,6 +235,8 @@ Core keys:
 ```text
 Ctrl-X Ctrl-S     Save
 Ctrl-X Ctrl-C     Quit
+Ctrl-X ^          Grow the inline viewport by one row
+Ctrl-X -          Shrink the inline viewport by one row
 Ctrl-S            Incremental search forward
 Ctrl-R            Incremental search backward
 Ctrl-S/Ctrl-R     Repeat search while searching
@@ -211,7 +251,7 @@ Ctrl-Left/Right   Word left/right
 Ctrl-P/Ctrl-N     Line up/down
 Alt-V/Ctrl-V      Page up/down
 PageUp/PageDown   Page up/down
-Alt-Up/Down       Shrink/grow the inline viewport
+Alt-Up/Down       Shrink/grow the inline viewport by one row
 Ctrl-Space        Set or clear mark
 Ctrl-W            Kill active region
 Alt-W             Copy active region
@@ -264,6 +304,15 @@ q
 ```
 
 ## inpick
+
+`--preview-hook /path/to/executable` notifies the caller after a readable preview
+has appeared, once per candidate per picker invocation. The executable receives
+the candidate as JSON on stdin; it may return a `display` object's contents as
+JSON on stdout to update the row immediately, or leave stdout empty. It runs
+directly, without a shell. Failed hooks end the picker with an error after
+restoring the terminal. The caller owns any state change, such as marking an
+Inbox message read. Unseen candidates and failed preview reads do not invoke it.
+Notifications still apply when the user later cancels the picker.
 
 Pass `--ctrl-d-action archive` to let Ctrl-D return the highlighted candidate
 with `"action":"archive"` in the selected result. The caller performs the

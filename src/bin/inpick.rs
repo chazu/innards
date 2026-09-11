@@ -29,6 +29,11 @@ struct Cli {
     #[arg(long)]
     ctrl_d_action: Option<String>,
 
+    /// Executable notified after a preview is displayed. Receives the candidate
+    /// as JSON on stdin; may return an updated display object as JSON on stdout.
+    #[arg(long)]
+    preview_hook: Option<PathBuf>,
+
     /// Accepted for consistency with other Innards surfaces; output is always JSON.
     #[arg(long)]
     result_json: bool,
@@ -43,6 +48,7 @@ fn main() -> Result<ExitCode> {
     config.title = cli.title;
     config.initial_query = cli.query;
     config.ctrl_d_action = cli.ctrl_d_action;
+    config.preview_hook = cli.preview_hook;
     let result = run_with(&provider, config)?;
     let _ = cli.result_json;
     write_result_json(&result)?;

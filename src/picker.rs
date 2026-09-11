@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -137,6 +138,7 @@ pub struct Config {
     pub title: String,
     pub initial_query: String,
     pub ctrl_d_action: Option<String>,
+    pub preview_hook: Option<PathBuf>,
 }
 
 impl Config {
@@ -147,6 +149,7 @@ impl Config {
             title: "inpick".to_string(),
             initial_query: String::new(),
             ctrl_d_action: None,
+            preview_hook: None,
         }
     }
 }
@@ -194,7 +197,11 @@ pub fn run_with(provider: &impl Provider, config: Config) -> Result<PickerResult
             drop(terminal);
             return Ok(app.result(Outcome::Cancelled, None));
         }
-        terminal.draw(|frame| draw(frame, &app))?;
+        let mut preview_visible = false;
+        terminal.draw(|frame| preview_visible = draw(frame, &app))?;
+        if preview_visible {
+            app.notify_preview()?;
+        }
 
         let ready = match event::poll(Duration::from_millis(80)) {
             Ok(ready) => ready,
@@ -211,6 +218,9 @@ pub fn run_with(provider: &impl Provider, config: Config) -> Result<PickerResult
             continue;
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        if terminal.handle_resize_key(key, MIN_PICKER_HEIGHT)? {
             continue;
         }
         match handle_key(&mut app, provider, key) {
@@ -235,6 +245,8 @@ struct App {
     matches: Vec<Candidate>,
     selected: usize,
     preview_scroll: isize,
+    previewed: HashSet<String>,
+    preview_displays: BTreeMap<String, CandidateDisplay>,
 }
 
 impl App {
@@ -247,6 +259,8 @@ impl App {
             matches,
             selected: 0,
             preview_scroll: 0,
+            previewed: HashSet::new(),
+            preview_displays: BTreeMap::new(),
         }
     }
 
@@ -256,8 +270,57 @@ impl App {
 
     fn refresh(&mut self, provider: &impl Provider) {
         self.matches = provider.search(self.input.value());
+        for candidate in &mut self.matches {
+            if let Some(display) = self.preview_displays.get(&candidate.id) {
+                candidate.display = Some(display.clone());
+            }
+        }
         self.selected = self.selected.min(self.matches.len().saturating_sub(1));
         self.preview_scroll = 0;
+    }
+
+    fn notify_preview(&mut self) -> Result<()> {
+        let Some(hook) = &self.config.preview_hook else {
+            return Ok(());
+        };
+        let Some(candidate) = self.selected() else {
+            return Ok(());
+        };
+        if self.previewed.contains(&candidate.id) {
+            return Ok(());
+        }
+        let id = candidate.id.clone();
+        let mut child = Command::new(hook)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to start preview hook {}", hook.display()))?;
+        let mut input = serde_json::to_vec(candidate)?;
+        input.push(b'\n');
+        let sent = child.stdin.take().expect("piped stdin").write_all(&input);
+        let output = child
+            .wait_with_output()
+            .context("failed to wait for preview hook")?;
+        sent.context("failed to send preview to hook")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "preview hook failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        if !output.stdout.iter().all(u8::is_ascii_whitespace) {
+            let display: CandidateDisplay = serde_json::from_slice(&output.stdout)
+                .context("preview hook returned an invalid display object")?;
+            self.preview_displays.insert(id.clone(), display.clone());
+            for candidate in &mut self.matches {
+                if candidate.id == id {
+                    candidate.display = Some(display.clone());
+                }
+            }
+        }
+        self.previewed.insert(id);
+        Ok(())
     }
 
     fn result(&self, outcome: Outcome, selection: Option<Candidate>) -> PickerResult {
@@ -342,7 +405,7 @@ fn handle_key(app: &mut App, provider: &impl Provider, key: KeyEvent) -> Action 
     Action::Continue
 }
 
-fn draw(frame: &mut Frame<'_>, app: &App) {
+fn draw(frame: &mut Frame<'_>, app: &App) -> bool {
     frame.render_widget(Clear, frame.area());
     let [query_area, body_area, status_area] = Layout::vertical([
         Constraint::Length(3),
@@ -389,7 +452,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     }
     frame.render_stateful_widget(list, list_area, &mut state);
 
-    draw_preview(frame, preview_area, app);
+    let preview_visible = draw_preview(frame, preview_area, app);
     let action_hint = app
         .config
         .ctrl_d_action
@@ -405,6 +468,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
         status_area,
     );
+    preview_visible
 }
 
 fn candidate_item(candidate: &Candidate) -> ListItem<'_> {
@@ -417,7 +481,7 @@ fn candidate_item(candidate: &Candidate) -> ListItem<'_> {
     }
     ListItem::new(Line::from(vec![
         Span::styled(
-            format!("{:<12}", candidate.kind),
+            format!("{:<12} ", candidate.kind),
             Style::default().fg(Color::Blue),
         ),
         Span::styled(candidate.label.as_str(), Style::default().fg(Color::White)),
@@ -434,14 +498,14 @@ fn candidate_item(candidate: &Candidate) -> ListItem<'_> {
     ]))
 }
 
-fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) -> bool {
     let Some(candidate) = app.selected() else {
         frame.render_widget(
             Paragraph::new("No candidate selected")
                 .block(Block::default().title(" Preview ").borders(Borders::ALL)),
             area,
         );
-        return;
+        return false;
     };
     let path = resolve_path(&app.config.root, &candidate.path);
     let title = match &candidate.display {
@@ -455,13 +519,14 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         None => format!(" Preview {}:{} ", candidate.path.display(), candidate.line),
     };
-    let lines = preview_lines(&path, candidate.line, area, app.preview_scroll);
+    let (lines, readable) = preview_lines(&path, candidate.line, area, app.preview_scroll);
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().title(title).borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
         area,
     );
+    readable && area.height > 2 && area.width > 8
 }
 
 fn resolve_path(root: &Path, path: &Path) -> PathBuf {
@@ -472,13 +537,24 @@ fn resolve_path(root: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn preview_lines(path: &Path, line: usize, area: Rect, scroll: isize) -> Vec<Line<'static>> {
+fn preview_lines(
+    path: &Path,
+    line: usize,
+    area: Rect,
+    scroll: isize,
+) -> (Vec<Line<'static>>, bool) {
     let Ok(contents) = std::fs::read_to_string(path) else {
-        return vec![Line::from(format!("Unable to read {}", path.display()))];
+        return (
+            vec![Line::from(format!("Unable to read {}", path.display()))],
+            false,
+        );
     };
     let source: Vec<&str> = contents.lines().collect();
     if source.is_empty() {
-        return vec![Line::from(format!("{} is empty", path.display()))];
+        return (
+            vec![Line::from(format!("{} is empty", path.display()))],
+            true,
+        );
     }
     let visible = usize::from(area.height.saturating_sub(2)).max(1);
     let target = line.saturating_sub(1) as isize;
@@ -486,7 +562,7 @@ fn preview_lines(path: &Path, line: usize, area: Rect, scroll: isize) -> Vec<Lin
     let start = (target - 2 + scroll).clamp(0, max_start).max(0) as usize;
     let end = (start + visible).min(source.len());
 
-    source[start..end]
+    let lines = source[start..end]
         .iter()
         .enumerate()
         .map(|(offset, text)| {
@@ -507,7 +583,8 @@ fn preview_lines(path: &Path, line: usize, area: Rect, scroll: isize) -> Vec<Lin
                 Span::styled((*text).to_string(), style),
             ])
         })
-        .collect()
+        .collect();
+    (lines, true)
 }
 
 #[cfg(test)]
@@ -592,7 +669,11 @@ mod tests {
         let provider = StaticProvider::new(vec![message]);
         let mut app = App::new(&provider, Config::new("."));
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let row = |y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
         assert!(row(4).contains("● Gusgus  14:32  Tests pass"));

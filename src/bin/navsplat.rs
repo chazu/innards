@@ -5,7 +5,6 @@ mod ui;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
@@ -14,10 +13,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use navsplat::inline_terminal::InlineTerminal;
 use navsplat::lsp::{self, CallDirection, LocationHit, LspClient, LspEvent, Symbol, SymbolKind};
-use ratatui::backend::CrosstermBackend;
-use ratatui::{Terminal, TerminalOptions, Viewport};
 use tui_input::backend::crossterm::to_input_request;
 use tui_input::{Input, InputRequest};
 
@@ -223,7 +220,7 @@ fn run_picker(
     let (client, mut child) = LspClient::start(root.clone(), tx)?;
     lsp::wait_for_ready(&rx, Duration::from_secs(20))?;
 
-    let mut terminal = TerminalGuard::enter(height)?;
+    let mut terminal = InlineTerminal::enter(height.max(10))?;
     let mut app = App {
         root,
         client,
@@ -249,7 +246,7 @@ fn run_picker(
         tick: 0,
     };
 
-    let selected = run_event_loop(&mut terminal.terminal, &mut app)?;
+    let selected = run_event_loop(&mut terminal, &mut app)?;
     drop(terminal);
 
     app.client.shutdown();
@@ -262,10 +259,7 @@ fn run_picker(
     Ok(())
 }
 
-fn run_event_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: &mut App,
-) -> Result<Option<OpenTarget>> {
+fn run_event_loop(terminal: &mut InlineTerminal, app: &mut App) -> Result<Option<OpenTarget>> {
     loop {
         drain_lsp_events(app);
         maybe_send_query(app);
@@ -276,6 +270,9 @@ fn run_event_loop(
         if event::poll(Duration::from_millis(40))? {
             match event::read()? {
                 Event::Key(key) => {
+                    if terminal.handle_resize_key(key, 10)? {
+                        continue;
+                    }
                     if let Some(result) = handle_key(app, key) {
                         return Ok(result);
                     }
@@ -865,32 +862,4 @@ fn detect_workspace_root(mut start: PathBuf) -> Result<PathBuf> {
     Err(anyhow!(
         "could not find workspace root from current directory; pass --root"
     ))
-}
-
-struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-}
-
-impl TerminalGuard {
-    fn enter(height: u16) -> Result<Self> {
-        enable_raw_mode()?;
-        let stdout = io::stdout();
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(height.max(10)),
-            },
-        )?;
-        terminal.clear()?;
-        Ok(Self { terminal })
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = self.terminal.clear();
-        let _ = disable_raw_mode();
-        let _ = self.terminal.show_cursor();
-    }
 }

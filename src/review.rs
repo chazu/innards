@@ -93,6 +93,9 @@ pub fn run_with(diff: String, config: Config) -> Result<ReviewResult> {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
         }
+        if terminal.handle_resize_key(key, MIN_HEIGHT)? {
+            continue;
+        }
         if let Some(outcome) = handle_key(&mut app, key) {
             drop(terminal);
             return Ok(app.result(outcome));

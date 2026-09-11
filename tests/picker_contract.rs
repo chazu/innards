@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -305,5 +306,95 @@ fn compact_message_display_hides_paths_and_preserves_selection_contract() {
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(value["selection"], candidate);
     assert_eq!(value["action"], "archive");
+    assert_terminal_mode_restored(&before, &after);
+}
+
+#[test]
+fn preview_hook_observes_only_displayed_readable_candidates_and_updates_the_row() {
+    let (scratch, _source, candidates, result, before, after) = fixture("preview-hook");
+    let mut rows: Vec<serde_json::Value> = fs::read_to_string(&candidates)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    rows[1]["path"] = serde_json::json!(scratch.join("missing.txt"));
+    let mut unseen = rows[0].clone();
+    unseen["id"] = serde_json::json!("unseen");
+    rows.push(unseen);
+    fs::write(
+        &candidates,
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let hook = scratch.join("preview-hook");
+    let notifications = scratch.join("notifications.jsonl");
+    fs::write(&hook, "#!/bin/sh\ncat >> \"$INNARDS_TEST_ARG_6\"\nprintf '%s\\n' '{\"prefix\":\"READ PREVIEW\",\"preview_title\":\"Message\",\"search_text\":\"read\"}'\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_inpick"));
+    let script = r#"
+        log_user 1
+        set timeout 10
+        set command [format {stty rows 24 columns 100; stty -g </dev/tty > %s; %s --preview-hook %s --result-json < %s > %s; status=$?; stty -g </dev/tty > %s; exit "$status"} $env(INNARDS_TEST_ARG_3) $env(INNARDS_TEST_ARG_0) $env(INNARDS_TEST_ARG_5) $env(INNARDS_TEST_ARG_1) $env(INNARDS_TEST_ARG_2) $env(INNARDS_TEST_ARG_4)]
+        spawn -noecho /bin/sh -c $command
+        expect -exact "\033\[6n"
+        send -- "\033\[1;1R"
+        expect {
+            -exact "READ PREVIEW" {}
+            timeout { exit 96 }
+        }
+        send -- "\033\[B"
+        expect {
+            -exact "Unable" {}
+            timeout { exit 95 }
+        }
+        send -- "\033\[A"
+        expect {
+            -exact "READ PREVIEW" {}
+            timeout { exit 94 }
+        }
+        send -- "\033"
+        expect {
+            eof {}
+            timeout {
+                catch {exec /bin/kill -KILL -- -[exp_pid]}
+                exit 97
+            }
+        }
+        exit [lindex [wait] 3]
+    "#;
+    let output = run_expect(
+        script,
+        &[
+            binary,
+            &candidates,
+            &result,
+            &before,
+            &after,
+            &hook,
+            &notifications,
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = fs::read_to_string(&notifications).unwrap();
+    assert_eq!(
+        events.lines().count(),
+        1,
+        "revisits, missing files and unseen rows must not notify"
+    );
+    let event: serde_json::Value = serde_json::from_str(events.trim()).unwrap();
+    assert_eq!(event, rows[0]);
+    let text = fs::read_to_string(&result).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(!text.contains('\u{1b}'));
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["outcome"], "cancelled");
     assert_terminal_mode_restored(&before, &after);
 }

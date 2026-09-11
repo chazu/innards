@@ -10,7 +10,6 @@ use clap::Args;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
-use crossterm::terminal::size;
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
 use syntect::highlighting::{Theme, ThemeSet};
@@ -18,7 +17,7 @@ use syntect::parsing::{SyntaxDefinition, SyntaxReference, SyntaxSet};
 
 mod render;
 
-use crate::inline_terminal::{InlineTerminal, termination_flag};
+use crate::inline_terminal::{InlineTerminal, ResizeStep, termination_flag};
 
 const DEFAULT_HEIGHT: u16 = 16;
 const MIN_HEIGHT: u16 = 5;
@@ -1355,6 +1354,15 @@ fn handle_key(
     terminal: &mut InlineTerminal,
     mode: Mode,
 ) -> Result<Option<Outcome>> {
+    // Resize before search/edit handling so the chord changes only geometry.
+    // Keep the editor's existing C-x save/quit state and dispatch intact.
+    if let Some(step) = ResizeStep::from_key(key, app.ctrl_x_pending) {
+        app.ctrl_x_pending = false;
+        terminal.resize_by(step, MIN_HEIGHT)?;
+        app.height = terminal.height();
+        app.status = format!("height {}", app.height);
+        return Ok(None);
+    }
     if app.ctrl_x_pending {
         return handle_ctrl_x_chord(app, key, mode);
     }
@@ -1441,12 +1449,6 @@ fn handle_key(
         }
         KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => app.page_up(),
         KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => app.page_down(),
-        KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
-            resize_inline_editor(app, terminal, app.height.saturating_sub(1))?;
-        }
-        KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-            resize_inline_editor(app, terminal, app.height.saturating_add(1))?;
-        }
         KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_word_left(),
         KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_word_right(),
         KeyCode::Left => app.move_left(),
@@ -1529,32 +1531,6 @@ fn handle_search_key(app: &mut Editor, key: KeyEvent) -> Result<Option<Outcome>>
     Ok(None)
 }
 
-fn resize_inline_editor(
-    app: &mut Editor,
-    terminal: &mut InlineTerminal,
-    requested_height: u16,
-) -> Result<()> {
-    let max_height = size().map(|(_, rows)| rows).unwrap_or(app.height);
-    let height = requested_height.max(MIN_HEIGHT).min(max_height);
-    if height == app.height {
-        return Ok(());
-    }
-
-    let (_, rows) = size().unwrap_or((0, app.height));
-    let anchor_y = resize_anchor_row(
-        app.last_drawn_top,
-        app.last_drawn_height,
-        height,
-        rows.max(1),
-    );
-    terminal.resize(height, anchor_y)?;
-    app.height = height;
-    app.last_drawn_height = height;
-    app.last_drawn_top = anchor_y;
-    app.status = format!("height {height}");
-    Ok(())
-}
-
 fn line_selection_range(
     app: &Editor,
     line: usize,
@@ -1596,20 +1572,6 @@ fn line_text(buffer: &Rope, line: usize) -> String {
     let line = line.min(buffer_line_count(buffer).saturating_sub(1));
     let len = line_len_chars(buffer, line);
     buffer.line(line).slice(..len).to_string()
-}
-
-fn resize_anchor_row(
-    previous_top: u16,
-    previous_height: u16,
-    new_height: u16,
-    terminal_rows: u16,
-) -> u16 {
-    let anchor = if new_height < previous_height {
-        previous_top.saturating_add(previous_height - new_height)
-    } else {
-        previous_top
-    };
-    anchor.min(terminal_rows.saturating_sub(1))
 }
 
 fn common_indent_len(lines: &[String]) -> usize {
@@ -2245,15 +2207,5 @@ mod tests {
 
         assert!(error.to_string().contains("refusing to edit symlink"));
         assert_eq!(fs::read_to_string(target).unwrap(), "alpha\n");
-    }
-
-    #[test]
-    fn resize_anchor_preserves_top_when_growing() {
-        assert_eq!(resize_anchor_row(8, 16, 17, 24), 8);
-    }
-
-    #[test]
-    fn resize_anchor_preserves_bottom_when_shrinking() {
-        assert_eq!(resize_anchor_row(8, 16, 12, 24), 12);
     }
 }
