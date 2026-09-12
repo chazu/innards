@@ -11,7 +11,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tui_input::Input;
@@ -49,6 +51,16 @@ pub struct CandidateDisplay {
     pub preview_title: String,
     #[serde(default)]
     pub search_text: String,
+    /// Named values rendered as a table in the candidate pane.  A picker
+    /// unions names across its candidates to form the header row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<CandidateColumn>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CandidateColumn {
+    pub name: String,
+    pub value: String,
 }
 
 impl Candidate {
@@ -111,7 +123,7 @@ impl Provider for StaticProvider {
             .iter()
             .filter(|candidate| {
                 let searchable = format!(
-                    "{} {} {} {} {} {} {}",
+                    "{} {} {} {} {} {} {} {}",
                     candidate.id,
                     candidate.label,
                     candidate.kind,
@@ -121,7 +133,18 @@ impl Provider for StaticProvider {
                     candidate
                         .display
                         .as_ref()
-                        .map_or("", |d| d.search_text.as_str())
+                        .map_or("", |d| d.search_text.as_str()),
+                    candidate
+                        .display
+                        .as_ref()
+                        .map(|d| {
+                            d.columns
+                                .iter()
+                                .map(|column| format!("{} {}", column.name, column.value))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default()
                 )
                 .to_lowercase();
                 terms.iter().all(|term| searchable.contains(term))
@@ -436,21 +459,60 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> bool {
         .min(query_area.width.saturating_sub(2) as usize) as u16;
     frame.set_cursor_position((query_area.x + 1 + cursor, query_area.y + 1));
 
-    let items: Vec<ListItem<'_>> = app.matches.iter().map(candidate_item).collect();
-    let list = List::new(items)
-        .block(Block::default().title(" Candidates ").borders(Borders::ALL))
-        .highlight_symbol("> ")
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        );
-    let mut state = ListState::default();
-    if !app.matches.is_empty() {
-        state.select(Some(app.selected));
+    if let Some(columns) = table_columns(&app.matches) {
+        let headers = std::iter::once("object".to_string())
+            .chain(columns.iter().cloned())
+            .collect::<Vec<_>>();
+        let rows = app.matches.iter().map(|candidate| {
+            Row::new(
+                std::iter::once(candidate.label.clone())
+                    .chain(columns.iter().map(|name| candidate_column(candidate, name)))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let count = headers.len() as u16;
+        let widths = (0..headers.len())
+            .map(|_| Constraint::Percentage(100 / count))
+            .collect::<Vec<_>>();
+        let table = Table::new(rows, widths)
+            .header(
+                Row::new(headers).style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .block(Block::default().title(" Candidates ").borders(Borders::ALL))
+            .column_spacing(1)
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ");
+        let mut state = TableState::default();
+        if !app.matches.is_empty() {
+            state.select(Some(app.selected));
+        }
+        frame.render_stateful_widget(table, list_area, &mut state);
+    } else {
+        let items: Vec<ListItem<'_>> = app.matches.iter().map(candidate_item).collect();
+        let list = List::new(items)
+            .block(Block::default().title(" Candidates ").borders(Borders::ALL))
+            .highlight_symbol("> ")
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            );
+        let mut state = ListState::default();
+        if !app.matches.is_empty() {
+            state.select(Some(app.selected));
+        }
+        frame.render_stateful_widget(list, list_area, &mut state);
     }
-    frame.render_stateful_widget(list, list_area, &mut state);
 
     let preview_visible = draw_preview(frame, preview_area, app);
     let action_hint = app
@@ -469,6 +531,26 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> bool {
         status_area,
     );
     preview_visible
+}
+
+fn table_columns(candidates: &[Candidate]) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for candidate in candidates {
+        for column in candidate.display.as_ref()?.columns.iter() {
+            if !column.name.is_empty() && !names.contains(&column.name) {
+                names.push(column.name.clone());
+            }
+        }
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+fn candidate_column(candidate: &Candidate, name: &str) -> String {
+    candidate
+        .display
+        .as_ref()
+        .and_then(|display| display.columns.iter().find(|column| column.name == name))
+        .map_or_else(String::new, |column| column.value.clone())
 }
 
 fn candidate_item(candidate: &Candidate) -> ListItem<'_> {
@@ -665,6 +747,7 @@ mod tests {
             prefix: "● Gusgus  14:32".into(),
             preview_title: "Message".into(),
             search_text: String::new(),
+            columns: vec![],
         });
         let provider = StaticProvider::new(vec![message]);
         let mut app = App::new(&provider, Config::new("."));
@@ -680,6 +763,59 @@ mod tests {
         assert!(!row(4).contains("message_123.txt"));
         assert!(row(9).contains("Message"));
         assert!(!row(9).contains("message_123.txt"));
+    }
+
+    #[test]
+    fn property_columns_render_a_header_and_aligned_object_rows() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut first = candidate("counter-1", "Counter 00000001");
+        first.display = Some(CandidateDisplay {
+            prefix: String::new(),
+            preview_title: String::new(),
+            search_text: String::new(),
+            columns: vec![
+                CandidateColumn {
+                    name: "value".into(),
+                    value: "0".into(),
+                },
+                CandidateColumn {
+                    name: "step".into(),
+                    value: "1".into(),
+                },
+            ],
+        });
+        let mut second = candidate("counter-2", "Counter 00000002");
+        second.display = Some(CandidateDisplay {
+            prefix: String::new(),
+            preview_title: String::new(),
+            search_text: String::new(),
+            columns: vec![CandidateColumn {
+                name: "value".into(),
+                value: "37".into(),
+            }],
+        });
+        let provider = StaticProvider::new(vec![first, second]);
+        let app = App::new(&provider, Config::new("."));
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y| {
+            (0..100)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(row(4).contains("object"));
+        assert!(row(4).contains("value"));
+        assert!(row(4).contains("step"));
+        assert!(row(5).contains("Counter 00000001"));
+        assert!(row(5).contains("0"));
+        assert!(row(6).contains("Counter 00000002"));
+        assert!(table_columns(&app.matches).is_some());
     }
 
     #[test]
