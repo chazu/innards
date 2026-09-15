@@ -3,7 +3,6 @@ use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
@@ -18,6 +17,7 @@ use syntect::parsing::{SyntaxDefinition, SyntaxReference, SyntaxSet};
 mod render;
 
 use crate::inline_terminal::{InlineTerminal, ResizeStep, termination_flag};
+use crate::redraw::IDLE_POLL;
 
 const DEFAULT_HEIGHT: u16 = 16;
 const MIN_HEIGHT: u16 = 5;
@@ -1316,32 +1316,35 @@ fn run_editor(
     mode: Mode,
     interrupted: &AtomicBool,
 ) -> Result<Outcome> {
+    // The caller drew the first frame; every later frame follows an event, so
+    // an idle wait leaves the terminal untouched instead of re-highlighting.
     loop {
         if interrupted.load(Ordering::Relaxed) {
             return Ok(Outcome::Cancelled);
         }
 
-        let ready = match event::poll(Duration::from_millis(80)) {
+        let ready = match event::poll(IDLE_POLL) {
             Ok(ready) => ready,
             Err(_err) if interrupted.load(Ordering::Relaxed) => {
                 return Ok(Outcome::Cancelled);
             }
             Err(err) => return Err(err.into()),
         };
-        if ready {
-            match event::read() {
-                Ok(Event::Key(key))
-                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-                {
-                    if let Some(outcome) = handle_key(app, key, terminal, mode)? {
-                        return Ok(outcome);
-                    }
+        if !ready {
+            continue;
+        }
+        match event::read() {
+            Ok(Event::Key(key))
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+            {
+                if let Some(outcome) = handle_key(app, key, terminal, mode)? {
+                    return Ok(outcome);
                 }
-                Ok(Event::Mouse(mouse)) if mode == Mode::View => app.handle_mouse(mouse),
-                Ok(_) => {}
-                Err(err) => {
-                    app.status = format!("input error: {err}");
-                }
+            }
+            Ok(Event::Mouse(mouse)) if mode == Mode::View => app.handle_mouse(mouse),
+            Ok(_) => {}
+            Err(err) => {
+                app.status = format!("input error: {err}");
             }
         }
         terminal.draw(|frame| render::draw(frame, app, syntax, mode))?;

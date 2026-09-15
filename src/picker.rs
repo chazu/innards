@@ -3,7 +3,6 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -20,6 +19,8 @@ use tui_input::Input;
 use tui_input::backend::crossterm::to_input_request;
 
 use crate::inline_terminal::{InlineTerminal, termination_flag};
+use crate::preview::PreviewCache;
+use crate::redraw::{IDLE_POLL, Redraw};
 
 const DEFAULT_HEIGHT: u16 = 20;
 const MIN_PICKER_HEIGHT: u16 = 10;
@@ -105,12 +106,48 @@ pub trait Provider {
 #[derive(Clone, Debug)]
 pub struct StaticProvider {
     candidates: Vec<Candidate>,
+    /// Lower-cased searchable text per candidate, built once at load so a
+    /// keystroke only runs `contains` over each entry.
+    haystacks: Vec<String>,
 }
 
 impl StaticProvider {
     pub fn new(candidates: Vec<Candidate>) -> Self {
-        Self { candidates }
+        let haystacks = candidates.iter().map(search_haystack).collect();
+        Self {
+            candidates,
+            haystacks,
+        }
     }
+}
+
+/// Every field a query term may match, joined in a fixed order and lower-cased.
+fn search_haystack(candidate: &Candidate) -> String {
+    format!(
+        "{} {} {} {} {} {} {} {}",
+        candidate.id,
+        candidate.label,
+        candidate.kind,
+        candidate.detail,
+        candidate.path.display(),
+        candidate.display.as_ref().map_or("", |d| d.prefix.as_str()),
+        candidate
+            .display
+            .as_ref()
+            .map_or("", |d| d.search_text.as_str()),
+        candidate
+            .display
+            .as_ref()
+            .map(|d| {
+                d.columns
+                    .iter()
+                    .map(|column| format!("{} {}", column.name, column.value))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default()
+    )
+    .to_lowercase()
 }
 
 impl Provider for StaticProvider {
@@ -121,35 +158,9 @@ impl Provider for StaticProvider {
             .collect();
         self.candidates
             .iter()
-            .filter(|candidate| {
-                let searchable = format!(
-                    "{} {} {} {} {} {} {} {}",
-                    candidate.id,
-                    candidate.label,
-                    candidate.kind,
-                    candidate.detail,
-                    candidate.path.display(),
-                    candidate.display.as_ref().map_or("", |d| d.prefix.as_str()),
-                    candidate
-                        .display
-                        .as_ref()
-                        .map_or("", |d| d.search_text.as_str()),
-                    candidate
-                        .display
-                        .as_ref()
-                        .map(|d| {
-                            d.columns
-                                .iter()
-                                .map(|column| format!("{} {}", column.name, column.value))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                        .unwrap_or_default()
-                )
-                .to_lowercase();
-                terms.iter().all(|term| searchable.contains(term))
-            })
-            .cloned()
+            .zip(&self.haystacks)
+            .filter(|(_, haystack)| terms.iter().all(|term| haystack.contains(term.as_str())))
+            .map(|(candidate, _)| candidate.clone())
             .collect()
     }
 }
@@ -214,19 +225,24 @@ pub fn run_with(provider: &impl Provider, config: Config) -> Result<PickerResult
     let interrupted = termination_flag()?;
     let mut app = App::new(provider, config);
     let mut terminal = InlineTerminal::enter(app.config.height.max(MIN_PICKER_HEIGHT))?;
+    let mut redraw = Redraw::new();
 
     loop {
         if interrupted.load(Ordering::Relaxed) {
             drop(terminal);
             return Ok(app.result(Outcome::Cancelled, None));
         }
-        let mut preview_visible = false;
-        terminal.draw(|frame| preview_visible = draw(frame, &app))?;
-        if preview_visible {
-            app.notify_preview()?;
+        if redraw.take() {
+            let mut preview_visible = false;
+            terminal.draw(|frame| preview_visible = draw(frame, &mut app))?;
+            if preview_visible && app.notify_preview()? {
+                // The hook changed a row; show it before waiting for input.
+                redraw.request();
+                continue;
+            }
         }
 
-        let ready = match event::poll(Duration::from_millis(80)) {
+        let ready = match event::poll(IDLE_POLL) {
             Ok(ready) => ready,
             Err(_) if interrupted.load(Ordering::Relaxed) => {
                 drop(terminal);
@@ -237,7 +253,9 @@ pub fn run_with(provider: &impl Provider, config: Config) -> Result<PickerResult
         if !ready {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
+        let event = event::read()?;
+        redraw.request();
+        let Event::Key(key) = event else {
             continue;
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -266,24 +284,31 @@ struct App {
     config: Config,
     input: Input,
     matches: Vec<Candidate>,
+    /// Union of property column names across the matches, or `None` when the
+    /// plain list layout applies. Recomputed whenever the matches change.
+    columns: Option<Vec<String>>,
     selected: usize,
     preview_scroll: isize,
     previewed: HashSet<String>,
     preview_displays: BTreeMap<String, CandidateDisplay>,
+    preview: PreviewCache,
 }
 
 impl App {
     fn new(provider: &impl Provider, config: Config) -> Self {
         let input = Input::from(config.initial_query.clone());
         let matches = provider.search(input.value());
+        let columns = table_columns(&matches);
         Self {
             config,
             input,
             matches,
+            columns,
             selected: 0,
             preview_scroll: 0,
             previewed: HashSet::new(),
             preview_displays: BTreeMap::new(),
+            preview: PreviewCache::new(),
         }
     }
 
@@ -298,19 +323,22 @@ impl App {
                 candidate.display = Some(display.clone());
             }
         }
+        self.columns = table_columns(&self.matches);
         self.selected = self.selected.min(self.matches.len().saturating_sub(1));
         self.preview_scroll = 0;
     }
 
-    fn notify_preview(&mut self) -> Result<()> {
+    /// Run the preview hook once for the selected candidate. Returns whether
+    /// the hook changed the candidate's display, which needs a fresh frame.
+    fn notify_preview(&mut self) -> Result<bool> {
         let Some(hook) = &self.config.preview_hook else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(candidate) = self.selected() else {
-            return Ok(());
+            return Ok(false);
         };
         if self.previewed.contains(&candidate.id) {
-            return Ok(());
+            return Ok(false);
         }
         let id = candidate.id.clone();
         let mut child = Command::new(hook)
@@ -332,6 +360,7 @@ impl App {
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
+        let mut updated = false;
         if !output.stdout.iter().all(u8::is_ascii_whitespace) {
             let display: CandidateDisplay = serde_json::from_slice(&output.stdout)
                 .context("preview hook returned an invalid display object")?;
@@ -341,9 +370,11 @@ impl App {
                     candidate.display = Some(display.clone());
                 }
             }
+            self.columns = table_columns(&self.matches);
+            updated = true;
         }
         self.previewed.insert(id);
-        Ok(())
+        Ok(updated)
     }
 
     fn result(&self, outcome: Outcome, selection: Option<Candidate>) -> PickerResult {
@@ -428,7 +459,7 @@ fn handle_key(app: &mut App, provider: &impl Provider, key: KeyEvent) -> Action 
     Action::Continue
 }
 
-fn draw(frame: &mut Frame<'_>, app: &App) -> bool {
+fn draw(frame: &mut Frame<'_>, app: &mut App) -> bool {
     frame.render_widget(Clear, frame.area());
     let [query_area, body_area, status_area] = Layout::vertical([
         Constraint::Length(3),
@@ -459,61 +490,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> bool {
         .min(query_area.width.saturating_sub(2) as usize) as u16;
     frame.set_cursor_position((query_area.x + 1 + cursor, query_area.y + 1));
 
-    if let Some(columns) = table_columns(&app.matches) {
-        let headers = std::iter::once("object".to_string())
-            .chain(columns.iter().cloned())
-            .collect::<Vec<_>>();
-        let rows = app.matches.iter().map(|candidate| {
-            Row::new(
-                std::iter::once(candidate.label.clone())
-                    .chain(columns.iter().map(|name| candidate_column(candidate, name)))
-                    .collect::<Vec<_>>(),
-            )
-        });
-        let count = headers.len() as u16;
-        let widths = (0..headers.len())
-            .map(|_| Constraint::Percentage(100 / count))
-            .collect::<Vec<_>>();
-        let table = Table::new(rows, widths)
-            .header(
-                Row::new(headers).style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            )
-            .block(Block::default().title(" Candidates ").borders(Borders::ALL))
-            .column_spacing(1)
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> ");
-        let mut state = TableState::default();
-        if !app.matches.is_empty() {
-            state.select(Some(app.selected));
-        }
-        frame.render_stateful_widget(table, list_area, &mut state);
-    } else {
-        let items: Vec<ListItem<'_>> = app.matches.iter().map(candidate_item).collect();
-        let list = List::new(items)
-            .block(Block::default().title(" Candidates ").borders(Borders::ALL))
-            .highlight_symbol("> ")
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            );
-        let mut state = ListState::default();
-        if !app.matches.is_empty() {
-            state.select(Some(app.selected));
-        }
-        frame.render_stateful_widget(list, list_area, &mut state);
-    }
-
+    draw_candidates(frame, list_area, app);
     let preview_visible = draw_preview(frame, preview_area, app);
     let action_hint = app
         .config
@@ -531,6 +508,85 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> bool {
         status_area,
     );
     preview_visible
+}
+
+/// Only the rows that fit are built. A fresh list state scrolls so the
+/// selection sits on the bottom row once it passes the visible height, and the
+/// window below reproduces that placement without allocating every match.
+fn draw_candidates(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let block = Block::default().title(" Candidates ").borders(Borders::ALL);
+    let highlight = Style::default()
+        .bg(Color::DarkGray)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let inner_height = usize::from(block.inner(area).height);
+    if let Some(columns) = &app.columns {
+        let headers = std::iter::once("object".to_string())
+            .chain(columns.iter().cloned())
+            .collect::<Vec<_>>();
+        let visible = inner_height.saturating_sub(1);
+        let first = visible_window_start(app.selected, visible);
+        let rows = app
+            .matches
+            .iter()
+            .skip(first)
+            .take(visible)
+            .map(|candidate| {
+                Row::new(
+                    std::iter::once(candidate.label.clone())
+                        .chain(columns.iter().map(|name| candidate_column(candidate, name)))
+                        .collect::<Vec<_>>(),
+                )
+            });
+        let count = headers.len() as u16;
+        let widths = (0..headers.len())
+            .map(|_| Constraint::Percentage(100 / count))
+            .collect::<Vec<_>>();
+        let table = Table::new(rows, widths)
+            .header(
+                Row::new(headers).style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .block(block)
+            .column_spacing(1)
+            .row_highlight_style(highlight)
+            .highlight_symbol("> ");
+        let mut state = TableState::default();
+        if !app.matches.is_empty() && visible > 0 {
+            state.select(Some(app.selected - first));
+        }
+        frame.render_stateful_widget(table, area, &mut state);
+    } else {
+        let first = visible_window_start(app.selected, inner_height);
+        let items: Vec<ListItem<'_>> = app
+            .matches
+            .iter()
+            .skip(first)
+            .take(inner_height)
+            .map(candidate_item)
+            .collect();
+        let list = List::new(items)
+            .block(block)
+            .highlight_symbol("> ")
+            .highlight_style(highlight);
+        let mut state = ListState::default();
+        if !app.matches.is_empty() && inner_height > 0 {
+            state.select(Some(app.selected - first));
+        }
+        frame.render_stateful_widget(list, area, &mut state);
+    }
+}
+
+/// First row of the window a fresh list state shows for `selected`.
+fn visible_window_start(selected: usize, visible: usize) -> usize {
+    if visible == 0 {
+        0
+    } else {
+        selected.saturating_sub(visible - 1)
+    }
 }
 
 fn table_columns(candidates: &[Candidate]) -> Option<Vec<String>> {
@@ -580,7 +636,7 @@ fn candidate_item(candidate: &Candidate) -> ListItem<'_> {
     ]))
 }
 
-fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) -> bool {
+fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> bool {
     let Some(candidate) = app.selected() else {
         frame.render_widget(
             Paragraph::new("No candidate selected")
@@ -590,6 +646,7 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) -> bool {
         return false;
     };
     let path = resolve_path(&app.config.root, &candidate.path);
+    let line = candidate.line;
     let title = match &candidate.display {
         Some(display) => format!(
             " {} ",
@@ -601,7 +658,8 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) -> bool {
         ),
         None => format!(" Preview {}:{} ", candidate.path.display(), candidate.line),
     };
-    let (lines, readable) = preview_lines(&path, candidate.line, area, app.preview_scroll);
+    let scroll = app.preview_scroll;
+    let (lines, readable) = preview_lines(app.preview.lines(&path), &path, line, area, scroll);
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().title(title).borders(Borders::ALL))
@@ -620,18 +678,18 @@ fn resolve_path(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn preview_lines(
+    source: Option<&[String]>,
     path: &Path,
     line: usize,
     area: Rect,
     scroll: isize,
 ) -> (Vec<Line<'static>>, bool) {
-    let Ok(contents) = std::fs::read_to_string(path) else {
+    let Some(source) = source else {
         return (
             vec![Line::from(format!("Unable to read {}", path.display()))],
             false,
         );
     };
-    let source: Vec<&str> = contents.lines().collect();
     if source.is_empty() {
         return (
             vec![Line::from(format!("{} is empty", path.display()))],
@@ -662,7 +720,7 @@ fn preview_lines(
                     format!("{line_number:>5} "),
                     Style::default().fg(Color::DarkGray),
                 ),
-                Span::styled((*text).to_string(), style),
+                Span::styled(text.clone(), style),
             ])
         })
         .collect();
@@ -673,6 +731,33 @@ fn preview_lines(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(test_name: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "innards-picker-unit-{test_name}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn candidate(id: &str, label: &str) -> Candidate {
         Candidate {
@@ -754,7 +839,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal
             .draw(|frame| {
-                draw(frame, &app);
+                draw(frame, &mut app);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -796,11 +881,11 @@ mod tests {
             }],
         });
         let provider = StaticProvider::new(vec![first, second]);
-        let app = App::new(&provider, Config::new("."));
+        let mut app = App::new(&provider, Config::new("."));
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         terminal
             .draw(|frame| {
-                draw(frame, &app);
+                draw(frame, &mut app);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -857,5 +942,118 @@ mod tests {
                 .get("action")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn search_haystack_joins_every_field_lowercased_in_a_fixed_order() {
+        let mut item = candidate("Kube::Pod>>ready", "Kube::Pod>>ready");
+        item.display = Some(CandidateDisplay {
+            prefix: "● Gusgus".into(),
+            preview_title: "Message".into(),
+            search_text: "Second Paragraph".into(),
+            columns: vec![CandidateColumn {
+                name: "Value".into(),
+                value: "37".into(),
+            }],
+        });
+        assert_eq!(
+            search_haystack(&item),
+            "kube::pod>>ready kube::pod>>ready method instance method trash/kube/pod.trash ● gusgus second paragraph value 37"
+        );
+        assert_eq!(
+            search_haystack(&candidate("x", "X")),
+            "x x method instance method trash/kube/pod.trash   "
+        );
+    }
+
+    #[test]
+    fn search_matches_property_columns_case_insensitively() {
+        let mut item = candidate("counter-1", "Counter 00000001");
+        item.display = Some(CandidateDisplay {
+            prefix: String::new(),
+            preview_title: String::new(),
+            search_text: String::new(),
+            columns: vec![CandidateColumn {
+                name: "value".into(),
+                value: "37".into(),
+            }],
+        });
+        let provider = StaticProvider::new(vec![item, candidate("other", "Other")]);
+
+        assert_eq!(provider.search("VALUE 37")[0].id, "counter-1");
+        assert_eq!(provider.search("counter 37").len(), 1);
+        assert!(provider.search("value 38").is_empty());
+        assert_eq!(provider.search("").len(), 2);
+    }
+
+    #[test]
+    fn visible_window_keeps_the_selection_on_the_bottom_row_once_it_scrolls() {
+        assert_eq!(visible_window_start(0, 5), 0);
+        assert_eq!(visible_window_start(4, 5), 0);
+        assert_eq!(visible_window_start(5, 5), 1);
+        assert_eq!(visible_window_start(29, 5), 25);
+        assert_eq!(visible_window_start(7, 0), 0);
+    }
+
+    #[test]
+    fn long_candidate_lists_build_only_the_visible_rows() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let items = (0..40)
+            .map(|index| candidate(&format!("id-{index:03}"), &format!("candidate-{index:03}")))
+            .collect();
+        let provider = StaticProvider::new(items);
+        let mut app = App::new(&provider, Config::new("."));
+        app.selected = 30;
+        let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(frame, &mut app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y| (0..70).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        let rows: Vec<String> = (0..20).map(row).collect();
+        let selected = rows
+            .iter()
+            .position(|text| text.contains("> "))
+            .expect("selected row is rendered");
+
+        assert!(rows[selected].contains("candidate-030"));
+        assert!(
+            rows[selected + 1].starts_with('└'),
+            "the selection sits on the last list row: {:?}",
+            rows[selected + 1]
+        );
+        assert!(rows[selected - 1].contains("candidate-029"));
+        assert!(!rows.iter().any(|text| text.contains("candidate-000")));
+    }
+
+    #[test]
+    fn preview_source_is_read_once_across_redraws() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let scratch = ScratchDir::new("preview-cache");
+        let source = scratch.join("Pod.trash");
+        std::fs::write(&source, "package: Kube\nPod subclass: Object\n").unwrap();
+        let mut item = candidate("Kube::Pod", "Kube::Pod");
+        item.path = source;
+        item.line = 2;
+        let provider = StaticProvider::new(vec![item]);
+        let mut app = App::new(&provider, Config::new("."));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        for _ in 0..3 {
+            terminal
+                .draw(|frame| {
+                    draw(frame, &mut app);
+                })
+                .unwrap();
+        }
+
+        assert_eq!(app.preview.reads(), 1);
+        let buffer = terminal.backend().buffer();
+        let screen = (0..20)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Pod subclass: Object"));
     }
 }

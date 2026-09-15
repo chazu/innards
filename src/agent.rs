@@ -2,7 +2,7 @@
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::sync::{atomic::Ordering, mpsc};
-use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::inline_terminal::{InlineTerminal, ResizeStep, termination_flag};
+use crate::redraw::Redraw;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Session {
@@ -780,32 +781,46 @@ pub fn run(height: u16) -> Result<()> {
     let mut terminal = InlineTerminal::enter(height.max(11))?;
     terminal.enable_bracketed_paste()?;
     let mut stdout = io::stdout().lock();
+    // Frames are drawn only after bridge input, terminal input, or the
+    // disconnect transition. Bridge frames cannot wake the poll, so the wait
+    // stays short for a while after any activity and lengthens when idle.
+    let mut redraw = Redraw::new();
     loop {
         if interrupted.load(Ordering::Relaxed) {
             break;
         }
         loop {
             match receiver.try_recv() {
-                Ok(Ok(input)) => app.apply(input)?,
+                Ok(Ok(input)) => {
+                    app.apply(input)?;
+                    redraw.activity(Instant::now());
+                }
                 Ok(Err(error)) => {
                     app.status = format!("Invalid bridge frame: {error}");
+                    redraw.activity(Instant::now());
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    if app.connected {
+                        redraw.request();
+                    }
                     app.connected = false;
                     break;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
-        terminal.draw(|frame| draw(frame, &mut app))?;
-        if let Some(intent) = app.viewed_intent() {
-            serde_json::to_writer(&mut stdout, &intent)?;
-            writeln!(stdout)?;
-            stdout.flush()?;
+        if redraw.take() {
+            terminal.draw(|frame| draw(frame, &mut app))?;
+            if let Some(intent) = app.viewed_intent() {
+                serde_json::to_writer(&mut stdout, &intent)?;
+                writeln!(stdout)?;
+                stdout.flush()?;
+            }
         }
-        if !event::poll(Duration::from_millis(80))? {
+        if !event::poll(redraw.poll_timeout(Instant::now()))? {
             continue;
         }
+        redraw.activity(Instant::now());
         match event::read()? {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 if let Some(step) = ResizeStep::from_key(key, app.ctrl_x) {

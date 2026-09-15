@@ -15,10 +15,14 @@ use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use navsplat::inline_terminal::InlineTerminal;
 use navsplat::lsp::{self, CallDirection, LocationHit, LspClient, LspEvent, Symbol, SymbolKind};
+use navsplat::preview::PreviewCache;
+use navsplat::redraw::{IDLE_POLL, Redraw};
 use tui_input::backend::crossterm::to_input_request;
 use tui_input::{Input, InputRequest};
 
 const DEBOUNCE: Duration = Duration::from_millis(140);
+/// Frame interval while a spinner is visible.
+const SPINNER_POLL: Duration = Duration::from_millis(40);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 enum SidePaneMode {
@@ -138,6 +142,7 @@ struct App {
     side_selected: HashMap<String, usize>,
     focus: FocusArea,
     tick: u64,
+    preview: PreviewCache,
 }
 
 fn main() -> Result<()> {
@@ -244,6 +249,7 @@ fn run_picker(
         side_selected: HashMap::new(),
         focus: FocusArea::Symbols,
         tick: 0,
+        preview: PreviewCache::new(),
     };
 
     let selected = run_event_loop(&mut terminal, &mut app)?;
@@ -260,14 +266,35 @@ fn run_picker(
 }
 
 fn run_event_loop(terminal: &mut InlineTerminal, app: &mut App) -> Result<Option<OpenTarget>> {
+    let mut redraw = Redraw::new();
     loop {
-        drain_lsp_events(app);
-        maybe_send_query(app);
-        maybe_request_side_pane(app);
-        app.tick = app.tick.wrapping_add(1);
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        if drain_lsp_events(app) {
+            redraw.request();
+        }
+        if maybe_send_query(app) {
+            redraw.request();
+        }
+        if maybe_request_side_pane(app) {
+            redraw.request();
+        }
+        // Spinners advance one frame per iteration and keep the short poll;
+        // otherwise the loop waits for input, an LSP reply, or the debounce.
+        let animating = spinner_visible(app);
+        if animating {
+            app.tick = app.tick.wrapping_add(1);
+            redraw.request();
+        }
+        if redraw.take() {
+            terminal.draw(|frame| ui::draw(frame, app))?;
+        }
 
-        if event::poll(Duration::from_millis(40))? {
+        let timeout = if animating {
+            SPINNER_POLL
+        } else {
+            idle_poll_timeout(app)
+        };
+        if event::poll(timeout)? {
+            redraw.request();
             match event::read()? {
                 Event::Key(key) => {
                     if terminal.handle_resize_key(key, 10)? {
@@ -281,6 +308,40 @@ fn run_event_loop(terminal: &mut InlineTerminal, app: &mut App) -> Result<Option
                 _ => {}
             }
         }
+    }
+}
+
+/// Mirrors the two spinners `ui` draws: the status spinner while loading and
+/// the side pane's while its hits are pending.
+fn spinner_visible(app: &App) -> bool {
+    if app.loading {
+        return true;
+    }
+    if !app.completions_ready || app.side_mode == SidePaneMode::Source {
+        return false;
+    }
+    current_side_key(app).is_some_and(|key| {
+        !matches!(
+            app.side_states.get(&key),
+            Some(SidePaneState::Ready(_) | SidePaneState::Error(_))
+        )
+    })
+}
+
+/// Wait for input, but wake in time to send a pending debounced query.
+fn idle_poll_timeout(app: &App) -> Duration {
+    match app.dirty_since {
+        Some(since) => {
+            let remaining = DEBOUNCE.saturating_sub(since.elapsed());
+            if remaining.is_zero() {
+                // The debounce elapsed without a send because the query
+                // matches the last request; there is nothing to wait for.
+                IDLE_POLL
+            } else {
+                remaining.min(IDLE_POLL)
+            }
+        }
+        None => IDLE_POLL,
     }
 }
 
@@ -489,10 +550,10 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_input_request(app: &mut App, request: InputRequest) {
-    if let Some(changed) = app.input.handle(request) {
-        if changed.value {
-            mark_dirty(app);
-        }
+    if let Some(changed) = app.input.handle(request)
+        && changed.value
+    {
+        mark_dirty(app);
     }
 }
 
@@ -505,13 +566,14 @@ fn mark_dirty(app: &mut App) {
     app.navigation_stack.clear();
 }
 
-fn maybe_send_query(app: &mut App) {
+/// Send the debounced query once it settles. Returns whether state changed.
+fn maybe_send_query(app: &mut App) -> bool {
     let Some(dirty_since) = app.dirty_since else {
-        return;
+        return false;
     };
     let query = app.input.value();
     if dirty_since.elapsed() < DEBOUNCE || query == app.last_sent_query {
-        return;
+        return false;
     }
 
     match app.client.workspace_symbol(query.to_string()) {
@@ -528,6 +590,7 @@ fn maybe_send_query(app: &mut App) {
             app.loading = false;
         }
     }
+    true
 }
 
 fn schedule_empty_retry(app: &mut App) {
@@ -539,22 +602,24 @@ fn schedule_empty_retry(app: &mut App) {
     app.last_sent_query.clear();
 }
 
-fn maybe_request_side_pane(app: &mut App) {
+/// Request the side pane's hits for the active symbol once. Returns whether
+/// state changed.
+fn maybe_request_side_pane(app: &mut App) -> bool {
     if !app.completions_ready || app.side_mode == SidePaneMode::Source {
-        return;
+        return false;
     }
 
     let Some(symbol) = active_symbol(app).cloned() else {
-        return;
+        return false;
     };
     let key = side_key(app.side_mode, &symbol);
     if app.side_states.contains_key(&key) {
-        return;
+        return false;
     }
 
     app.side_states.insert(key.clone(), SidePaneState::Loading);
     let result = match app.side_mode {
-        SidePaneMode::Source => return,
+        SidePaneMode::Source => return false,
         SidePaneMode::References => app.client.references(&symbol, key.clone()),
         SidePaneMode::Callers => app.client.incoming_calls(&symbol, key.clone()),
         SidePaneMode::Callees => app.client.outgoing_calls(&symbol, key.clone()),
@@ -572,6 +637,7 @@ fn maybe_request_side_pane(app: &mut App) {
             app.loading = false;
         }
     }
+    true
 }
 
 fn side_key(mode: SidePaneMode, symbol: &Symbol) -> String {
@@ -701,8 +767,11 @@ fn symbol_from_hit(hit: &LocationHit) -> Symbol {
     }
 }
 
-fn drain_lsp_events(app: &mut App) {
+/// Apply every queued LSP event. Returns whether any arrived.
+fn drain_lsp_events(app: &mut App) -> bool {
+    let mut received = false;
     while let Ok(event) = app.events.try_recv() {
+        received = true;
         match event {
             LspEvent::Symbols {
                 request_id,
@@ -805,6 +874,7 @@ fn drain_lsp_events(app: &mut App) {
             _ => {}
         }
     }
+    received
 }
 
 fn input_display_value(app: &App) -> String {

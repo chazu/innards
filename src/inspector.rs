@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -16,6 +15,7 @@ use tui_input::Input;
 use tui_input::backend::crossterm::to_input_request;
 
 use crate::inline_terminal::{InlineTerminal, termination_flag};
+use crate::redraw::{IDLE_POLL, Redraw};
 
 const DEFAULT_HEIGHT: u16 = 20;
 const MIN_HEIGHT: u16 = 8;
@@ -119,14 +119,17 @@ pub fn run_with(input: InspectionInput, config: Config) -> Result<InspectionResu
     let interrupted = termination_flag()?;
     let mut app = App::new(input, config);
     let mut terminal = InlineTerminal::enter(app.config.height.max(MIN_HEIGHT))?;
+    let mut redraw = Redraw::new();
 
     loop {
         if interrupted.load(Ordering::Relaxed) {
             drop(terminal);
             return Ok(app.result(Outcome::Cancelled, None));
         }
-        terminal.draw(|frame| draw(frame, &app))?;
-        let ready = match event::poll(Duration::from_millis(80)) {
+        if redraw.take() {
+            terminal.draw(|frame| draw(frame, &app))?;
+        }
+        let ready = match event::poll(IDLE_POLL) {
             Ok(ready) => ready,
             Err(_) if interrupted.load(Ordering::Relaxed) => {
                 drop(terminal);
@@ -137,7 +140,9 @@ pub fn run_with(input: InspectionInput, config: Config) -> Result<InspectionResu
         if !ready {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
+        let event = event::read()?;
+        redraw.request();
+        let Event::Key(key) = event else {
             continue;
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {

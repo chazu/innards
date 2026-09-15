@@ -1,6 +1,7 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use navsplat::lsp::{LocationHit, Symbol};
+use navsplat::preview::PreviewCache;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -13,7 +14,7 @@ use super::{
     input_display_value, selected_side_hit,
 };
 
-pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
+pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if !app.completions_ready {
         draw_loading(frame, app);
         return;
@@ -190,34 +191,61 @@ fn symbol_list_item(symbol: &Symbol) -> ListItem<'static> {
     ]))
 }
 
-fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    if app.focus == FocusArea::SidePane {
-        if let Some(hit) = selected_side_hit(app) {
-            let lines = preview_file_lines(
-                &app.root,
-                &hit.file,
-                hit.line,
-                hit.line,
-                area,
-                app.preview_scroll,
-            );
-            let title = format!(" Preview {}:{} ", hit.file.display(), hit.line);
-            let preview = Paragraph::new(lines)
-                .block(Block::default().title(title).borders(Borders::ALL))
-                .wrap(Wrap { trim: false });
-            frame.render_widget(preview, area);
-            return;
-        }
+/// What the preview pane shows: the side pane's hit while that pane has focus,
+/// otherwise the active symbol.
+struct PreviewTarget {
+    file: PathBuf,
+    line: u32,
+    highlight_start: u32,
+    highlight_end: u32,
+}
+
+fn preview_target(app: &App) -> Option<PreviewTarget> {
+    if app.focus == FocusArea::SidePane
+        && let Some(hit) = selected_side_hit(app)
+    {
+        return Some(PreviewTarget {
+            file: hit.file.clone(),
+            line: hit.line,
+            highlight_start: hit.line,
+            highlight_end: hit.line,
+        });
     }
 
-    let selected = active_symbol(app);
-    let lines = selected
-        .map(|symbol| preview_lines(&app.root, symbol, area, app.preview_scroll))
-        .unwrap_or_else(|| vec![Line::from("No symbol selected")]);
+    let symbol = active_symbol(app)?;
+    let (highlight_start, highlight_end) = if symbol.kind.is_broad_container() {
+        (symbol.line, symbol.line)
+    } else {
+        (
+            symbol.line.min(symbol.end_line),
+            symbol.line.max(symbol.end_line),
+        )
+    };
+    Some(PreviewTarget {
+        file: symbol.file.clone(),
+        line: symbol.line,
+        highlight_start,
+        highlight_end,
+    })
+}
 
-    let title = selected
-        .map(|symbol| format!(" Preview {}:{} ", symbol.file.display(), symbol.line))
-        .unwrap_or_else(|| " Preview ".to_string());
+fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let (lines, title) = match preview_target(app) {
+        Some(target) => (
+            preview_file_lines(
+                &app.root,
+                &mut app.preview,
+                &target,
+                area,
+                app.preview_scroll,
+            ),
+            format!(" Preview {}:{} ", target.file.display(), target.line),
+        ),
+        None => (
+            vec![Line::from("No symbol selected")],
+            " Preview ".to_string(),
+        ),
+    };
 
     let preview = Paragraph::new(lines)
         .block(Block::default().title(title).borders(Borders::ALL))
@@ -331,60 +359,33 @@ fn side_pane_items(hits: &[LocationHit]) -> Vec<ListItem<'static>> {
         .collect()
 }
 
-fn preview_lines(
-    root: &Path,
-    symbol: &Symbol,
-    area: Rect,
-    preview_scroll: isize,
-) -> Vec<Line<'static>> {
-    let (highlight_start, highlight_end) = if symbol.kind.is_broad_container() {
-        (symbol.line, symbol.line)
-    } else {
-        (
-            symbol.line.min(symbol.end_line),
-            symbol.line.max(symbol.end_line),
-        )
-    };
-    preview_file_lines(
-        root,
-        &symbol.file,
-        highlight_start,
-        highlight_end,
-        area,
-        preview_scroll,
-    )
-}
-
 fn preview_file_lines(
     root: &Path,
-    file: &Path,
-    highlight_start: u32,
-    highlight_end: u32,
+    cache: &mut PreviewCache,
+    target: &PreviewTarget,
     area: Rect,
     preview_scroll: isize,
 ) -> Vec<Line<'static>> {
-    let path = if file.is_absolute() {
-        file.to_path_buf()
+    let path = if target.file.is_absolute() {
+        target.file.clone()
     } else {
-        root.join(file)
+        root.join(&target.file)
     };
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    let Some(lines) = cache.lines(&path) else {
         return vec![Line::from(format!("Unable to read {}", path.display()))];
     };
-
-    let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
         return vec![Line::from(format!("{} is empty", path.display()))];
     }
 
     let visible_lines = usize::from(area.height.saturating_sub(2)).max(1);
-    let target = highlight_start.saturating_sub(1) as isize;
-    let default_start = target - 2;
+    let first_highlight = target.highlight_start.saturating_sub(1) as isize;
+    let default_start = first_highlight - 2;
     let max_start = lines.len().saturating_sub(visible_lines) as isize;
     let start = (default_start + preview_scroll).clamp(0, max_start).max(0) as usize;
     let end = (start + visible_lines).min(lines.len());
-    let highlight_start = highlight_start as usize;
-    let highlight_end = highlight_end as usize;
+    let highlight_start = target.highlight_start as usize;
+    let highlight_end = target.highlight_end as usize;
 
     let mut out = Vec::with_capacity(end - start);
     for (index, text) in lines[start..end].iter().enumerate() {
@@ -402,7 +403,7 @@ fn preview_file_lines(
                 format!("{line_no:>5} "),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled((*text).to_string(), style),
+            Span::styled(text.clone(), style),
         ]));
     }
     out

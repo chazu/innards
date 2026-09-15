@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-09-14
+
+- Applets no longer redraw on idle poll timeouts. Frames follow input, resize,
+  bridge snapshots and acks, LSP replies, or spinner ticks, and the idle poll
+  is 250 ms (`inagent` keeps 80 ms for two seconds after activity; `navsplat`
+  keeps 40 ms while a spinner is visible). Keystroke latency is unchanged.
+- `inpick` and `navsplat` cache preview sources by path, size, and
+  modification time instead of re-reading the file per frame. `inpick` also
+  precomputes its lower-cased search text per candidate and builds only the
+  visible candidate rows. See
+  `docs/performance-first-tranche-innards-2026-09-15.md`.
+
 ## 2026-09-11
 
 - The `inagent` composer soft-wraps long lines, reflows on resize, and scrolls

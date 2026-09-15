@@ -1,6 +1,5 @@
 use std::io::{self, Write};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -11,6 +10,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use serde::{Deserialize, Serialize};
 
 use crate::inline_terminal::{InlineTerminal, termination_flag};
+use crate::redraw::{IDLE_POLL, Redraw};
 
 const DEFAULT_HEIGHT: u16 = 20;
 const MIN_HEIGHT: u16 = 7;
@@ -68,15 +68,18 @@ pub fn run_with(diff: String, config: Config) -> Result<ReviewResult> {
     let interrupted = termination_flag()?;
     let mut app = App::new(diff, config)?;
     let mut terminal = InlineTerminal::enter(app.config.height.max(MIN_HEIGHT))?;
+    let mut redraw = Redraw::new();
 
     loop {
         if interrupted.load(Ordering::Relaxed) {
             drop(terminal);
             return Ok(app.result(Outcome::Cancelled));
         }
-        terminal.draw(|frame| draw(frame, &app))?;
+        if redraw.take() {
+            terminal.draw(|frame| draw(frame, &app))?;
+        }
 
-        let ready = match event::poll(Duration::from_millis(80)) {
+        let ready = match event::poll(IDLE_POLL) {
             Ok(ready) => ready,
             Err(_) if interrupted.load(Ordering::Relaxed) => {
                 drop(terminal);
@@ -87,7 +90,9 @@ pub fn run_with(diff: String, config: Config) -> Result<ReviewResult> {
         if !ready {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
+        let event = event::read()?;
+        redraw.request();
+        let Event::Key(key) = event else {
             continue;
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {

@@ -4,4 +4,6 @@ pub mod inline_text;
 pub mod inspector;
 pub mod lsp;
 pub mod picker;
+pub mod preview;
+pub mod redraw;
 pub mod review;
