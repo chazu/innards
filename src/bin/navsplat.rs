@@ -330,7 +330,11 @@ fn spinner_visible(app: &App) -> bool {
 
 /// Wait for input, but wake in time to send a pending debounced query.
 fn idle_poll_timeout(app: &App) -> Duration {
-    match app.dirty_since {
+    idle_poll_timeout_for(app.dirty_since)
+}
+
+fn idle_poll_timeout_for(dirty_since: Option<Instant>) -> Duration {
+    match dirty_since {
         Some(since) => {
             let remaining = DEBOUNCE.saturating_sub(since.elapsed());
             if remaining.is_zero() {
@@ -572,8 +576,20 @@ fn maybe_send_query(app: &mut App) -> bool {
         return false;
     };
     let query = app.input.value();
-    if dirty_since.elapsed() < DEBOUNCE || query == app.last_sent_query {
-        return false;
+    match debounced_query_action(dirty_since, query, &app.last_sent_query) {
+        DebouncedQueryAction::Pending => return false,
+        DebouncedQueryAction::Reverted => {
+            // The input returned to the request already in flight or already
+            // completed. There is no new request to send, so clear its debounce
+            // state and retain a spinner only while that request is unresolved.
+            settle_reverted_query(
+                &mut app.dirty_since,
+                &mut app.loading,
+                app.completions_ready,
+            );
+            return true;
+        }
+        DebouncedQueryAction::Send => {}
     }
 
     match app.client.workspace_symbol(query.to_string()) {
@@ -591,6 +607,73 @@ fn maybe_send_query(app: &mut App) -> bool {
         }
     }
     true
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DebouncedQueryAction {
+    Pending,
+    Reverted,
+    Send,
+}
+
+fn debounced_query_action(
+    dirty_since: Instant,
+    query: &str,
+    last_sent_query: &str,
+) -> DebouncedQueryAction {
+    if dirty_since.elapsed() < DEBOUNCE {
+        DebouncedQueryAction::Pending
+    } else if query == last_sent_query {
+        DebouncedQueryAction::Reverted
+    } else {
+        DebouncedQueryAction::Send
+    }
+}
+
+fn settle_reverted_query(
+    dirty_since: &mut Option<Instant>,
+    loading: &mut bool,
+    completions_ready: bool,
+) {
+    *dirty_since = None;
+    *loading = !completions_ready;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reverted_debounced_query_settles_without_a_second_request() {
+        // A was sent and its applicable response settled. Editing A -> B -> A
+        // should consume the expired debounce without requesting A again.
+        let last_sent_query = "A";
+        assert_eq!(
+            debounced_query_action(Instant::now(), "B", last_sent_query),
+            DebouncedQueryAction::Pending
+        );
+        assert_eq!(
+            debounced_query_action(Instant::now(), "A", last_sent_query),
+            DebouncedQueryAction::Pending
+        );
+        let mut dirty_since = Some(Instant::now() - DEBOUNCE);
+        let mut loading = true;
+        let completions_ready = true;
+
+        assert_eq!(
+            debounced_query_action(dirty_since.unwrap(), "A", last_sent_query),
+            DebouncedQueryAction::Reverted,
+            "the reverted query sends no new request"
+        );
+        settle_reverted_query(&mut dirty_since, &mut loading, completions_ready);
+
+        assert!(
+            dirty_since.is_none(),
+            "the reverted query is no longer dirty"
+        );
+        assert!(!loading, "the settled request no longer shows a spinner");
+        assert_eq!(idle_poll_timeout_for(dirty_since), IDLE_POLL);
+    }
 }
 
 fn schedule_empty_retry(app: &mut App) {

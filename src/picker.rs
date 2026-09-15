@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -101,22 +102,26 @@ pub fn read_json_lines(reader: impl BufRead) -> Result<Vec<Candidate>> {
 
 pub trait Provider {
     fn search(&self, query: &str) -> Vec<Candidate>;
+
+    /// Replace a candidate's display data when it is enriched by a preview
+    /// hook. Providers which do not cache searchable data can ignore this.
+    fn update_display(&self, _id: &str, _display: CandidateDisplay) {}
 }
 
 #[derive(Clone, Debug)]
 pub struct StaticProvider {
-    candidates: Vec<Candidate>,
+    candidates: RefCell<Vec<Candidate>>,
     /// Lower-cased searchable text per candidate, built once at load so a
     /// keystroke only runs `contains` over each entry.
-    haystacks: Vec<String>,
+    haystacks: RefCell<Vec<String>>,
 }
 
 impl StaticProvider {
     pub fn new(candidates: Vec<Candidate>) -> Self {
         let haystacks = candidates.iter().map(search_haystack).collect();
         Self {
-            candidates,
-            haystacks,
+            candidates: RefCell::new(candidates),
+            haystacks: RefCell::new(haystacks),
         }
     }
 }
@@ -157,11 +162,25 @@ impl Provider for StaticProvider {
             .map(|term| term.to_lowercase())
             .collect();
         self.candidates
+            .borrow()
             .iter()
-            .zip(&self.haystacks)
+            .zip(self.haystacks.borrow().iter())
             .filter(|(_, haystack)| terms.iter().all(|term| haystack.contains(term.as_str())))
             .map(|(candidate, _)| candidate.clone())
             .collect()
+    }
+
+    fn update_display(&self, id: &str, display: CandidateDisplay) {
+        let mut candidates = self.candidates.borrow_mut();
+        let Some((index, candidate)) = candidates
+            .iter_mut()
+            .enumerate()
+            .find(|(_, candidate)| candidate.id == id)
+        else {
+            return;
+        };
+        candidate.display = Some(display);
+        self.haystacks.borrow_mut()[index] = search_haystack(candidate);
     }
 }
 
@@ -235,7 +254,7 @@ pub fn run_with(provider: &impl Provider, config: Config) -> Result<PickerResult
         if redraw.take() {
             let mut preview_visible = false;
             terminal.draw(|frame| preview_visible = draw(frame, &mut app))?;
-            if preview_visible && app.notify_preview()? {
+            if preview_visible && app.notify_preview(provider)? {
                 // The hook changed a row; show it before waiting for input.
                 redraw.request();
                 continue;
@@ -330,7 +349,7 @@ impl App {
 
     /// Run the preview hook once for the selected candidate. Returns whether
     /// the hook changed the candidate's display, which needs a fresh frame.
-    fn notify_preview(&mut self) -> Result<bool> {
+    fn notify_preview(&mut self, provider: &impl Provider) -> Result<bool> {
         let Some(hook) = &self.config.preview_hook else {
             return Ok(false);
         };
@@ -365,6 +384,7 @@ impl App {
             let display: CandidateDisplay = serde_json::from_slice(&output.stdout)
                 .context("preview hook returned an invalid display object")?;
             self.preview_displays.insert(id.clone(), display.clone());
+            provider.update_display(&id, display.clone());
             for candidate in &mut self.matches {
                 if candidate.id == id {
                     candidate.display = Some(display.clone());
@@ -984,6 +1004,31 @@ mod tests {
         assert_eq!(provider.search("counter 37").len(), 1);
         assert!(provider.search("value 38").is_empty());
         assert_eq!(provider.search("").len(), 2);
+    }
+
+    #[test]
+    fn preview_hook_display_data_remains_searchable_after_refresh() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchDir::new("preview-hook-search-cache");
+        let hook = scratch.join("preview-hook.sh");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nprintf '%s\\n' '{\"prefix\":\"\",\"preview_title\":\"\",\"search_text\":\"preview-hook-needle\",\"columns\":[{\"name\":\"hook_property\",\"value\":\"property-needle\"}]}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let provider = StaticProvider::new(vec![candidate("hooked", "original")]);
+        let mut config = Config::new(".");
+        config.preview_hook = Some(hook);
+        let mut app = App::new(&provider, config);
+
+        assert!(app.notify_preview(&provider).unwrap());
+        app.input = Input::from("preview-hook-needle hook_property property-needle".to_string());
+        app.refresh(&provider);
+
+        assert_eq!(app.matches.len(), 1);
+        assert_eq!(app.matches[0].id, "hooked");
     }
 
     #[test]
