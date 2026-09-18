@@ -1,5 +1,5 @@
 //! Presentation only: snapshots in, explicit intents out, terminal on /dev/tty.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::sync::{atomic::Ordering, mpsc};
 use std::time::Instant;
@@ -245,6 +245,7 @@ const COMMANDS: &[&str] = &[
     "Pause new work",
     "Resume queued work",
     "Stop displayed run",
+    "Compact context",
     "Detach",
 ];
 
@@ -310,12 +311,26 @@ impl App {
                     bail!("Bridge attempted to change the attached session");
                 }
                 self.session = session;
+                // A durable inbox item can be updated in place (for example,
+                // assignment progress). A newly displayed revision needs its
+                // own viewed acknowledgement even though its ID is unchanged.
+                let previous: HashMap<_, _> = self.entries.iter().map(|e| (&e.id, e)).collect();
+                for entry in &entries {
+                    if let Some(old) = previous.get(&entry.id) {
+                        if old.text != entry.text
+                            || old.title != entry.title
+                            || old.kind != entry.kind
+                        {
+                            self.viewed.remove(&entry.id);
+                        }
+                    }
+                }
                 self.entries = entries;
                 self.earlier = has_earlier;
                 self.window = window;
                 self.rebuild(self.width);
                 if self.status == "Waiting for session…" {
-                    self.status = "Attached · messages use the agent inbox".into();
+                    self.status = "Attached · direct session input".into();
                 }
             }
             Input::Ack {
@@ -376,6 +391,11 @@ impl App {
     }
     fn bottom(&self) -> usize {
         self.rows.len().saturating_sub(self.page)
+    }
+
+    fn scroll_down(&mut self, rows: usize) {
+        self.scroll = self.scroll.saturating_add(rows).min(self.bottom());
+        self.follow = self.scroll == self.bottom();
     }
 
     fn viewed_intent(&mut self) -> Option<Value> {
@@ -465,6 +485,9 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let previous_x = std::mem::take(&mut self.ctrl_x);
         let previous_c = std::mem::take(&mut self.ctrl_c);
+        if alt && key.code == KeyCode::Char('u') {
+            return self.detach();
+        }
         if previous_x && ctrl && key.code == KeyCode::Char('c') {
             return self.detach();
         }
@@ -520,6 +543,7 @@ impl App {
                                         Some(Overlay::ConfirmStop(self.session.run_id.clone()));
                                 }
                             }
+                            5 => return Some(self.request("compact_session", json!({}))),
                             _ => return self.detach(),
                         }
                     } else if key.code != KeyCode::Esc && !(ctrl && key.code == KeyCode::Char('g'))
@@ -576,8 +600,7 @@ impl App {
             return None;
         }
         if key.code == KeyCode::PageDown || (ctrl && key.code == KeyCode::Char('v')) {
-            self.scroll = (self.scroll + self.page).min(self.bottom());
-            self.follow = self.scroll == self.bottom();
+            self.scroll_down(self.page);
             return None;
         }
         if self.composing {
@@ -595,12 +618,12 @@ impl App {
                     } else if !body.trim().is_empty() {
                         let request = self.request("send_message", json!({"body":body}));
                         self.pending = Some((self.next_request, body));
-                        self.status = "Sending through inbox…".into();
+                        self.status = "Sending to session…".into();
                         return Some(request);
                     }
                 } else {
                     self.ctrl_c = true;
-                    self.status = "C-c C-c sends · C-x C-c detaches".into();
+                    self.status = "C-c C-c sends · M-u toggle · C-x C-c detaches".into();
                 }
                 return None;
             }
@@ -614,7 +637,7 @@ impl App {
                     self.scroll = self.scroll.saturating_sub(1);
                 }
                 KeyCode::Down | KeyCode::Char('n') if key.code == KeyCode::Down || ctrl => {
-                    self.scroll = (self.scroll + 1).min(self.bottom());
+                    self.scroll_down(1);
                 }
                 KeyCode::Enter | KeyCode::Char('i') => self.composing = true,
                 _ => {}
@@ -738,7 +761,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .collect();
     frame.render_widget(Paragraph::new(draft).block(composer), areas[2]);
     let mut footer = format!(
-        "{}\nTab transcript/composer · C-s search · M-x commands · C-x C-c detach",
+        "{}\nTab transcript/composer · C-s search · M-x commands · M-u toggle · C-x C-c detach",
         app.status
     );
     if let Some(overlay) = &app.overlay {
@@ -957,6 +980,34 @@ mod tests {
         );
     }
     #[test]
+    fn compact_targets_the_attached_session_without_sending_a_message() {
+        let mut a = App::default();
+        a.apply(snapshot(vec![])).unwrap();
+        a.overlay = Some(Overlay::Commands(5));
+        let request = a
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(request["intent"], "compact_session");
+        assert!(request.get("body").is_none());
+        assert_eq!(a.draft.text(), "");
+    }
+
+    #[test]
+    fn option_u_detaches_from_composer_transcript_and_commands() {
+        for composing in [true, false] {
+            let mut a = App::default();
+            a.apply(snapshot(vec![])).unwrap();
+            a.composing = composing;
+            a.overlay = Some(Overlay::Commands(0));
+            assert_eq!(
+                a.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT))
+                    .unwrap()["intent"],
+                "dismiss"
+            );
+        }
+    }
+
+    #[test]
     fn detach_is_never_a_stop() {
         let mut a = App::default();
         a.apply(snapshot(vec![])).unwrap();
@@ -965,6 +1016,60 @@ mod tests {
         a.draft.insert("unsent");
         assert!(a.detach().is_none());
         assert!(matches!(a.overlay, Some(Overlay::DiscardDraft)));
+    }
+    #[test]
+    fn updated_visible_message_is_acknowledged_again() {
+        let mut app = App::default();
+        let entry =
+            |text: &str| json!({"id":"status","kind":"message","title":"Assignment","text":text});
+        app.apply(snapshot(vec![entry("queued")])).unwrap();
+        assert!(app.viewed_intent().is_some());
+        app.apply(snapshot(vec![entry("queued")])).unwrap();
+        assert!(app.viewed_intent().is_none());
+        app.apply(snapshot(vec![entry("completed")])).unwrap();
+        assert_eq!(
+            app.viewed_intent().unwrap()["message_ids"],
+            json!(["status"])
+        );
+    }
+    #[test]
+    fn scrolling_back_to_bottom_resumes_following_new_output() {
+        let entry = |id: &str| json!({"id":id,"kind":"assistant","title":id,"text":"one\ntwo\nthree\nfour\nfive"});
+        for down in [
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            key('n'),
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            key('v'),
+        ] {
+            let mut app = App::default();
+            app.composing = false;
+            app.apply(snapshot(vec![entry("a"), entry("b"), entry("c")]))
+                .unwrap();
+            app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            let anchor = app.rows[app.scroll].id.clone();
+            app.apply(snapshot(vec![
+                entry("a"),
+                entry("b"),
+                entry("c"),
+                entry("d"),
+            ]))
+            .unwrap();
+            assert_eq!(app.rows[app.scroll].id, anchor);
+            assert!(!app.follow);
+            while app.scroll < app.bottom() {
+                app.key(down);
+            }
+            app.apply(snapshot(vec![
+                entry("a"),
+                entry("b"),
+                entry("c"),
+                entry("d"),
+                entry("e"),
+            ]))
+            .unwrap();
+            assert_eq!(app.scroll, app.bottom(), "{down:?} must resume following");
+            assert!(app.follow);
+        }
     }
     #[test]
     fn older_snapshot_preserves_scroll_anchor() {
