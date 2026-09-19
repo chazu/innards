@@ -45,10 +45,13 @@ The binaries will be under `target/release/`.
 
 ## inagent
 
-The caller streams version-1 `snapshot` and `ack` records to stdin. `inagent`
-renders through `/dev/tty` and flushes explicit intents to stdout; it owns no
-agent process, database, or delivery policy. In Trashtalk, open it with
-`@ AgentSession browse` → **Attach to conversation**, or `@ "$session" focus`.
+The caller streams version-1 `start`, `snapshot`, and `ack` records to stdin.
+`inagent` renders through `/dev/tty` and flushes explicit intents to stdout; it
+owns no agent process, database, or delivery policy. In Trashtalk, open it with
+`@ Agent::Session browse` → **Attach to conversation**, `@ "$session" focus`,
+or `@ Gusgus focusCurrent`. The last form presents an empty composer when the
+global Gusgus conversation does not exist; its first send emits
+`start_conversation` and then pins the returned session.
 
 Long lines wrap to the composer width and scroll to keep the cursor visible.
 Enter inserts a newline; **C-c C-c** sends the draft. **Tab** switches between
@@ -64,14 +67,16 @@ signals never emit a stop intent. A disconnected bridge leaves the loaded
 backlog available and disables sending.
 
 ```json
+{"schema_version":1,"type":"start","agent":"Gusgus","scope":"global","workspace":"/repo","profile":"jcode"}
 {"schema_version":1,"type":"snapshot","session":{"id":"s","title":"Gusgus","workspace":"/repo","profile":"jcode","lifecycle":"open","activity":"running","run_id":"r","pending":0},"entries":[{"id":"entry-1","kind":"assistant","title":"Assistant","text":"Working on the parser."}],"has_earlier":false,"window":400}
 {"schema_version":1,"type":"ack","request_id":1,"ok":true,"message":"Message sent"}
 ```
 
 Intents contain `schema_version`, a connection-local numeric `request_id`, and
-`intent`: `send_message` (+ `body`), `mark_viewed` (+ `message_ids`),
-`load_older`, `pause_session`, `resume_session`, `interrupt_run` (+ `run_id`), or
-`dismiss`. The caller validates every intent against current domain state.
+`intent`: `start_conversation` or `send_message` (+ `body`), `mark_viewed`
+(+ `message_ids`), `load_older`, `pause_session`, `resume_session`,
+`interrupt_run` (+ `run_id`), `compact_session`, or `dismiss`. The caller
+validates every intent against current domain state.
 
 ## Install
 

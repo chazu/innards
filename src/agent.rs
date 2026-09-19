@@ -39,9 +39,22 @@ pub struct Entry {
     pub text: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct ConversationStart {
+    pub agent: String,
+    pub scope: String,
+    pub workspace: String,
+    pub profile: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Input {
+    Start {
+        schema_version: u8,
+        #[serde(flatten)]
+        conversation: ConversationStart,
+    },
     Snapshot {
         schema_version: u8,
         session: Session,
@@ -60,24 +73,35 @@ pub enum Input {
 pub fn parse_input(line: &str) -> Result<Input> {
     let input: Input = serde_json::from_str(line)?;
     let version = match &input {
-        Input::Snapshot { schema_version, .. } | Input::Ack { schema_version, .. } => {
-            *schema_version
-        }
+        Input::Start { schema_version, .. }
+        | Input::Snapshot { schema_version, .. }
+        | Input::Ack { schema_version, .. } => *schema_version,
     };
     if version != 1 {
         bail!("Unsupported agent view schema {version}");
     }
-    if let Input::Snapshot {
-        session, entries, ..
-    } = &input
-    {
-        if session.id.is_empty() || entries.iter().any(|e| e.id.is_empty()) {
-            bail!("Snapshot requires stable session and entry IDs");
+    match &input {
+        Input::Start { conversation, .. } => {
+            if conversation.agent != "Gusgus"
+                || conversation.scope != "global"
+                || conversation.workspace.is_empty()
+                || conversation.profile.is_empty()
+            {
+                bail!("Conversation start requires global Gusgus context");
+            }
         }
-        let mut ids = std::collections::HashSet::new();
-        if entries.iter().any(|e| !ids.insert(&e.id)) {
-            bail!("Duplicate transcript entry ID");
+        Input::Snapshot {
+            session, entries, ..
+        } => {
+            if session.id.is_empty() || entries.iter().any(|e| e.id.is_empty()) {
+                bail!("Snapshot requires stable session and entry IDs");
+            }
+            let mut ids = std::collections::HashSet::new();
+            if entries.iter().any(|e| !ids.insert(&e.id)) {
+                bail!("Duplicate transcript entry ID");
+            }
         }
+        Input::Ack { .. } => {}
     }
     Ok(input)
 }
@@ -250,6 +274,7 @@ const COMMANDS: &[&str] = &[
 ];
 
 pub struct App {
+    start: Option<ConversationStart>,
     session: Session,
     entries: Vec<Entry>,
     rows: Vec<Row>,
@@ -274,6 +299,7 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            start: None,
             session: Session::default(),
             entries: vec![],
             rows: vec![],
@@ -300,6 +326,13 @@ impl Default for App {
 impl App {
     pub fn apply(&mut self, input: Input) -> Result<()> {
         match input {
+            Input::Start { conversation, .. } => {
+                if !self.session.id.is_empty() {
+                    bail!("Bridge attempted to detach from the attached session");
+                }
+                self.start = Some(conversation);
+                self.status = "No current conversation · C-c C-c starts and sends".into();
+            }
             Input::Snapshot {
                 session,
                 entries,
@@ -310,6 +343,7 @@ impl App {
                 if !self.session.id.is_empty() && self.session.id != session.id {
                     bail!("Bridge attempted to change the attached session");
                 }
+                self.start = None;
                 self.session = session;
                 // A durable inbox item can be updated in place (for example,
                 // assignment progress). A newly displayed revision needs its
@@ -570,15 +604,27 @@ impl App {
             return None;
         }
         if alt && key.code == KeyCode::Char('x') {
+            if self.session.id.is_empty() {
+                self.status = "Send the first message, or detach with M-u or C-x C-c".into();
+                return None;
+            }
             self.overlay = Some(Overlay::Commands(0));
             return None;
         }
         if ctrl && (key.code == KeyCode::Char('s') || key.code == KeyCode::Char('r')) {
+            if self.session.id.is_empty() {
+                self.status = "Conversation history is available after the first message".into();
+                return None;
+            }
             self.overlay = Some(Overlay::Search(Draft::default()));
             self.composing = false;
             return None;
         }
         if key.code == KeyCode::Tab {
+            if self.session.id.is_empty() {
+                self.status = "Compose the first message, or detach with M-u or C-x C-c".into();
+                return None;
+            }
             self.composing = !self.composing;
             return None;
         }
@@ -611,19 +657,34 @@ impl App {
             if ctrl && key.code == KeyCode::Char('c') {
                 if previous_c {
                     let body = self.draft.text();
-                    if !self.connected || self.session.id.is_empty() {
+                    if !self.connected {
                         self.status = "Bridge disconnected; draft retained".into();
+                    } else if self.session.id.is_empty() && self.start.is_none() {
+                        self.status = "Waiting for conversation context; draft retained".into();
                     } else if self.pending.is_some() {
                         self.status = "Waiting for send acknowledgement".into();
                     } else if !body.trim().is_empty() {
-                        let request = self.request("send_message", json!({"body":body}));
+                        let intent = if self.session.id.is_empty() {
+                            "start_conversation"
+                        } else {
+                            "send_message"
+                        };
+                        let request = self.request(intent, json!({"body":body}));
                         self.pending = Some((self.next_request, body));
-                        self.status = "Sending to session…".into();
+                        self.status = if self.session.id.is_empty() {
+                            "Starting Gusgus conversation…".into()
+                        } else {
+                            "Sending to session…".into()
+                        };
                         return Some(request);
                     }
                 } else {
                     self.ctrl_c = true;
-                    self.status = "C-c C-c sends · M-u toggle · C-x C-c detaches".into();
+                    self.status = if self.session.id.is_empty() {
+                        "C-c C-c starts and sends · M-u toggle · C-x C-c detaches".into()
+                    } else {
+                        "C-c C-c sends · M-u toggle · C-x C-c detaches".into()
+                    };
                 }
                 return None;
             }
@@ -697,36 +758,61 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.follow {
         app.scroll = app.bottom();
     }
-    let header = format!(
-        "{} · {} · {}/{} · {} queued{}\n{}",
-        app.session.title,
-        app.session.profile,
-        app.session.lifecycle,
-        app.session.activity,
-        app.session.pending,
-        if app.connected {
-            ""
-        } else {
-            " · DISCONNECTED"
-        },
-        app.session.workspace
-    );
+    let header = if let Some(start) = &app.start {
+        format!(
+            "New conversation · {} · {} · {}{}\n{}",
+            start.agent,
+            start.scope,
+            start.profile,
+            if app.connected {
+                ""
+            } else {
+                " · DISCONNECTED"
+            },
+            start.workspace
+        )
+    } else {
+        format!(
+            "{} · {} · {}/{} · {} queued{}\n{}",
+            app.session.title,
+            app.session.profile,
+            app.session.lifecycle,
+            app.session.activity,
+            app.session.pending,
+            if app.connected {
+                ""
+            } else {
+                " · DISCONNECTED"
+            },
+            app.session.workspace
+        )
+    };
     frame.render_widget(
         Paragraph::new(display_text(&header)).style(Style::default().fg(Color::Cyan)),
         areas[0],
     );
-    let title = format!(
-        " Conversation · {}{} ",
-        if app.follow { "following" } else { "backlog" },
-        if app.earlier { " · M-< earlier" } else { "" }
-    );
-    let rows: Vec<Line> = app
-        .rows
-        .iter()
-        .skip(app.scroll)
-        .take(app.page)
-        .map(|r| Line::styled(r.text.clone(), Style::default().fg(r.color)))
-        .collect();
+    let title = if app.start.is_some() {
+        " New conversation ".to_owned()
+    } else {
+        format!(
+            " Conversation · {}{} ",
+            if app.follow { "following" } else { "backlog" },
+            if app.earlier { " · M-< earlier" } else { "" }
+        )
+    };
+    let rows: Vec<Line> = if app.start.is_some() {
+        vec![Line::styled(
+            "Send the first message to create the global Gusgus conversation.",
+            Style::default().fg(Color::DarkGray),
+        )]
+    } else {
+        app.rows
+            .iter()
+            .skip(app.scroll)
+            .take(app.page)
+            .map(|r| Line::styled(r.text.clone(), Style::default().fg(r.color)))
+            .collect()
+    };
     frame.render_widget(
         Paragraph::new(rows).block(
             Block::default()
@@ -740,9 +826,14 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         ),
         areas[1],
     );
+    let composer_title = if app.start.is_some() {
+        " First message · C-c C-c start and send · Enter newline "
+    } else {
+        " Message · C-c C-c send · Enter newline "
+    };
     let composer = Block::default()
         .borders(Borders::ALL)
-        .title(" Message · C-c C-c send · Enter newline ")
+        .title(composer_title)
         .border_style(Style::default().fg(if app.composing {
             Color::Cyan
         } else {
@@ -760,10 +851,17 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .map(Line::raw)
         .collect();
     frame.render_widget(Paragraph::new(draft).block(composer), areas[2]);
-    let mut footer = format!(
-        "{}\nTab transcript/composer · C-s search · M-x commands · M-u toggle · C-x C-c detach",
-        app.status
-    );
+    let mut footer = if app.start.is_some() {
+        format!(
+            "{}\nC-c C-c start and send · M-u toggle · C-x C-c detach",
+            app.status
+        )
+    } else {
+        format!(
+            "{}\nTab transcript/composer · C-s search · M-x commands · M-u toggle · C-x C-c detach",
+            app.status
+        )
+    };
     if let Some(overlay) = &app.overlay {
         footer = match overlay {
             Overlay::DiscardDraft => "Discard unsent draft and detach? y/n".into(),
@@ -878,6 +976,12 @@ mod tests {
     fn snapshot(entries: Vec<Value>) -> Input {
         parse_input(&json!({"schema_version":1,"type":"snapshot","session":{"id":"s","title":"Gusgus","workspace":"/repo","profile":"jcode","lifecycle":"open","activity":"running","run_id":"r","pending":0},"entries":entries,"has_earlier":true,"window":400}).to_string()).unwrap()
     }
+    fn start() -> Input {
+        parse_input(
+            &json!({"schema_version":1,"type":"start","agent":"Gusgus","scope":"global","workspace":"/repo","profile":"jcode"}).to_string(),
+        )
+        .unwrap()
+    }
     fn composer_row(terminal: &Terminal<TestBackend>, y: u16) -> String {
         let buffer = terminal.backend().buffer();
         (1..buffer.area.width - 1)
@@ -966,6 +1070,32 @@ mod tests {
         })
         .unwrap();
         assert!(a.draft.text().is_empty());
+    }
+    #[test]
+    fn empty_gusgus_view_starts_on_first_send_and_pins_the_resulting_session() {
+        let mut app = App::default();
+        app.apply(start()).unwrap();
+        app.draft.insert("first direct message");
+        app.key(key('c'));
+        let request = app.key(key('c')).unwrap();
+        assert_eq!(request["intent"], "start_conversation");
+        assert_eq!(request["body"], "first direct message");
+        app.apply(Input::Ack {
+            schema_version: 1,
+            request_id: 1,
+            ok: false,
+            message: "native input unavailable".into(),
+        })
+        .unwrap();
+        assert_eq!(app.draft.text(), "first direct message");
+        app.apply(snapshot(vec![])).unwrap();
+        assert!(app.start.is_none());
+        assert_eq!(app.session.id, "s");
+    }
+    #[test]
+    fn start_frame_is_limited_to_global_gusgus() {
+        let invalid = json!({"schema_version":1,"type":"start","agent":"Specialist","scope":"workspace","workspace":"/repo","profile":"jcode"});
+        assert!(parse_input(&invalid.to_string()).is_err());
     }
     #[test]
     fn stop_pins_displayed_run() {
