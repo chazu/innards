@@ -213,12 +213,34 @@ impl App {
         false
     }
 }
-fn list<'a>(title: &'a str, rows: Vec<String>, selected: bool) -> List<'a> {
-    List::new(rows.into_iter().map(ListItem::new).collect::<Vec<_>>()).block(
+fn list<'a>(
+    title: &'a str,
+    rows: Vec<String>,
+    selected: usize,
+    focused: bool,
+    height: u16,
+) -> List<'a> {
+    let visible = usize::from(height.saturating_sub(2)).max(1);
+    let start = selected.saturating_sub(visible.saturating_sub(1));
+    List::new(
+        rows.into_iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(i, row)| {
+                ListItem::new(if i == selected {
+                    format!("> {row}")
+                } else {
+                    row
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .block(
         Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .border_style(Style::default().fg(if selected {
+            .border_style(Style::default().fg(if focused {
                 Color::Cyan
             } else {
                 Color::DarkGray
@@ -247,17 +269,10 @@ fn draw(f: &mut Frame, a: &App) {
     f.render_widget(
         list(
             "Packages",
-            p.iter()
-                .enumerate()
-                .map(|(i, x)| {
-                    if i == a.package {
-                        format!("> {x}")
-                    } else {
-                        x.clone()
-                    }
-                })
-                .collect(),
+            p,
+            a.package,
             matches!(a.pane, Pane::Packages),
+            cols[0].height,
         ),
         cols[0],
     );
@@ -265,34 +280,27 @@ fn draw(f: &mut Frame, a: &App) {
         list(
             "Classes",
             cs.iter()
-                .enumerate()
-                .map(|(i, x)| {
-                    let s = format!(
+                .map(|x| {
+                    format!(
                         "{} {}",
                         if x.superclass.is_empty() { "" } else { "↳" },
                         x.name
-                    );
-                    if i == a.class { format!("> {s}") } else { s }
+                    )
                 })
                 .collect(),
+            a.class,
             matches!(a.pane, Pane::Classes),
+            cols[1].height,
         ),
         cols[1],
     );
     f.render_widget(
         list(
             "Protocol",
-            ps.iter()
-                .enumerate()
-                .map(|(i, x)| {
-                    if i == a.protocol {
-                        format!("> {x}")
-                    } else {
-                        x.clone()
-                    }
-                })
-                .collect(),
+            ps,
+            a.protocol,
             matches!(a.pane, Pane::Protocols),
+            cols[2].height,
         ),
         cols[2],
     );
@@ -300,13 +308,11 @@ fn draw(f: &mut Frame, a: &App) {
         list(
             "Methods",
             ms.iter()
-                .enumerate()
-                .map(|(i, x)| {
-                    let s = format!("{}{}", if x.raw { "raw " } else { "" }, x.selector);
-                    if i == a.method { format!("> {s}") } else { s }
-                })
+                .map(|x| format!("{}{}", if x.raw { "raw " } else { "" }, x.selector))
                 .collect(),
+            a.method,
             matches!(a.pane, Pane::Methods),
+            cols[3].height,
         ),
         cols[3],
     );
