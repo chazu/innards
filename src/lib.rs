@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod browser;
 pub mod inline_terminal;
 pub mod inline_text;
 pub mod inspector;
