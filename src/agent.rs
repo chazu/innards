@@ -67,6 +67,8 @@ pub enum Input {
         request_id: u64,
         ok: bool,
         message: String,
+        #[serde(default)]
+        session: Option<String>,
     },
 }
 
@@ -260,6 +262,7 @@ struct Row {
 enum Overlay {
     Commands(usize),
     ConfirmStop(String),
+    ConfirmFreshSession,
     DiscardDraft,
     Search(Draft),
 }
@@ -269,6 +272,7 @@ const COMMANDS: &[&str] = &[
     "Pause new work",
     "Resume queued work",
     "Stop displayed run",
+    "Start fresh conversation",
     "Compact context",
     "Detach",
 ];
@@ -291,6 +295,10 @@ pub struct App {
     ctrl_c: bool,
     next_request: u64,
     pending: Option<(u64, String)>,
+    // A bridge normally pins the view to one session. A successful explicit
+    // replacement is the sole exception, and must be acknowledged before its
+    // new snapshot can be accepted.
+    fresh_session_request: Option<(u64, Option<String>)>,
     width: usize,
     page: usize,
     viewed: HashSet<String>,
@@ -316,6 +324,7 @@ impl Default for App {
             ctrl_c: false,
             next_request: 0,
             pending: None,
+            fresh_session_request: None,
             width: 80,
             page: 12,
             viewed: HashSet::new(),
@@ -340,8 +349,25 @@ impl App {
                 window,
                 ..
             } => {
-                if !self.session.id.is_empty() && self.session.id != session.id {
+                let replacement = !self.session.id.is_empty() && self.session.id != session.id;
+                if replacement
+                    && self
+                        .fresh_session_request
+                        .as_ref()
+                        .and_then(|(_, expected)| expected.as_ref())
+                        != Some(&session.id)
+                {
                     bail!("Bridge attempted to change the attached session");
+                }
+                if replacement {
+                    self.entries.clear();
+                    self.rows.clear();
+                    self.draft = Draft::default();
+                    self.viewed.clear();
+                    self.read_requests.clear();
+                    self.pending = None;
+                    self.fresh_session_request = None;
+                    self.status = "Fresh conversation started · direct session input".into();
                 }
                 self.start = None;
                 self.session = session;
@@ -371,8 +397,20 @@ impl App {
                 request_id,
                 ok,
                 message,
+                session,
                 ..
             } => {
+                if let Some((id, _)) = &self.fresh_session_request {
+                    if *id == request_id {
+                        self.fresh_session_request = if ok {
+                            session
+                                .filter(|id| !id.is_empty())
+                                .map(|session| (*id, Some(session)))
+                        } else {
+                            None
+                        };
+                    }
+                }
                 if self.read_requests.remove(&request_id) && ok {
                     return Ok(());
                 }
@@ -479,6 +517,12 @@ impl App {
             None
         }
     }
+    fn fresh_session(&mut self) -> Value {
+        let request = self.request("start_fresh_session", json!({}));
+        self.fresh_session_request = Some((self.next_request, None));
+        self.status = "Ending this idle session and starting a fresh conversation…".into();
+        request
+    }
     fn older(&mut self) -> Option<Value> {
         self.follow = false;
         if self.earlier {
@@ -553,6 +597,17 @@ impl App {
                         self.overlay = Some(Overlay::ConfirmStop(run));
                     }
                 }
+                Overlay::ConfirmFreshSession => {
+                    if key.code == KeyCode::Char('y') {
+                        return Some(self.fresh_session());
+                    }
+                    if key.code != KeyCode::Char('n')
+                        && key.code != KeyCode::Esc
+                        && !(ctrl && key.code == KeyCode::Char('g'))
+                    {
+                        self.overlay = Some(Overlay::ConfirmFreshSession);
+                    }
+                }
                 Overlay::Commands(mut index) => {
                     if key.code == KeyCode::Down || (ctrl && key.code == KeyCode::Char('n')) {
                         index = (index + 1) % COMMANDS.len();
@@ -577,7 +632,8 @@ impl App {
                                         Some(Overlay::ConfirmStop(self.session.run_id.clone()));
                                 }
                             }
-                            5 => return Some(self.request("compact_session", json!({}))),
+                            5 => self.overlay = Some(Overlay::ConfirmFreshSession),
+                            6 => return Some(self.request("compact_session", json!({}))),
                             _ => return self.detach(),
                         }
                     } else if key.code != KeyCode::Esc && !(ctrl && key.code == KeyCode::Char('g'))
@@ -866,6 +922,13 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         footer = match overlay {
             Overlay::DiscardDraft => "Discard unsent draft and detach? y/n".into(),
             Overlay::ConfirmStop(run) => format!("Stop {run} and pause new work? y/n"),
+            Overlay::ConfirmFreshSession => {
+                if app.draft.chars.is_empty() {
+                    "End this idle session and start a fresh conversation? y/n".into()
+                } else {
+                    "End this idle session, discard the draft, and start fresh? y/n".into()
+                }
+            }
             Overlay::Search(q) => format!(
                 "Search: {} · C-s next · C-r previous · Enter done",
                 q.text()
@@ -1057,6 +1120,7 @@ mod tests {
             request_id: 1,
             ok: false,
             message: "paused".into(),
+            session: None,
         })
         .unwrap();
         assert_eq!(a.draft.text(), "literal $()\n日本語");
@@ -1067,6 +1131,7 @@ mod tests {
             request_id: 2,
             ok: true,
             message: "sent".into(),
+            session: None,
         })
         .unwrap();
         assert!(a.draft.text().is_empty());
@@ -1085,6 +1150,7 @@ mod tests {
             request_id: 1,
             ok: false,
             message: "native input unavailable".into(),
+            session: None,
         })
         .unwrap();
         assert_eq!(app.draft.text(), "first direct message");
@@ -1113,13 +1179,54 @@ mod tests {
     fn compact_targets_the_attached_session_without_sending_a_message() {
         let mut a = App::default();
         a.apply(snapshot(vec![])).unwrap();
-        a.overlay = Some(Overlay::Commands(5));
+        a.overlay = Some(Overlay::Commands(6));
         let request = a
             .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(request["intent"], "compact_session");
         assert!(request.get("body").is_none());
         assert_eq!(a.draft.text(), "");
+    }
+
+    #[test]
+    fn fresh_session_requires_confirmation_then_accepts_only_its_new_session() {
+        let mut a = App::default();
+        a.apply(snapshot(vec![
+            json!({"id":"old","kind":"message","title":"old","text":"history"}),
+        ]))
+        .unwrap();
+        a.draft.insert("unsent");
+        a.overlay = Some(Overlay::Commands(5));
+        assert!(
+            a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_none()
+        );
+        assert!(matches!(a.overlay, Some(Overlay::ConfirmFreshSession)));
+        let request = a
+            .key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(request["intent"], "start_fresh_session");
+        assert_eq!(
+            a.draft.text(),
+            "unsent",
+            "draft survives until replacement succeeds"
+        );
+        a.apply(Input::Ack {
+            schema_version: 1,
+            request_id: 1,
+            ok: true,
+            message: "Started a fresh conversation".into(),
+            session: Some("fresh".into()),
+        })
+        .unwrap();
+        let mut next = snapshot(vec![]);
+        if let Input::Snapshot { session, .. } = &mut next {
+            session.id = "fresh".into();
+        }
+        a.apply(next).unwrap();
+        assert_eq!(a.session.id, "fresh");
+        assert!(a.entries.is_empty());
+        assert!(a.draft.text().is_empty());
     }
 
     #[test]
