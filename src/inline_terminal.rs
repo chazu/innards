@@ -195,6 +195,10 @@ impl InlineTerminal {
         // MoveTo gives us the exact cursor position. Querying it again would
         // consume queued input while waiting for a terminal reply during resize.
         self.terminal = Self::new_terminal(&self.tty, height, Some(Position::new(0, anchor_y)))?;
+        // The old inline terminal only clears from its former origin. Clear
+        // again after constructing the new viewport so an expansion redraws
+        // every row rather than leaving the old surface above it visible.
+        self.terminal.clear()?;
         self.area.y = anchor_y;
         self.area.height = height;
         Ok(())
