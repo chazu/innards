@@ -339,6 +339,11 @@ pub fn run(input: &str, height: u16) -> Result<()> {
         };
         if event::poll(std::time::Duration::from_millis(250))? {
             if let Event::Key(k) = event::read()? {
+                if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && term.handle_resize_key(k, 12)?
+                {
+                    continue;
+                }
                 if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) && a.key(k.code) {
                     break;
                 }

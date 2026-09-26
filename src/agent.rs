@@ -16,7 +16,9 @@ use ratatui::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::inline_terminal::{InlineTerminal, ResizeStep, termination_flag};
+use crate::inline_terminal::{
+    InlineTerminal, ResizeStep, is_fullscreen_toggle_key, termination_flag,
+};
 use crate::redraw::Redraw;
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1007,6 +1009,11 @@ pub fn run(height: u16) -> Result<()> {
         redraw.activity(Instant::now());
         match event::read()? {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                if is_fullscreen_toggle_key(key, app.ctrl_x) {
+                    app.ctrl_x = false;
+                    terminal.toggle_full_height()?;
+                    continue;
+                }
                 if let Some(step) = ResizeStep::from_key(key, app.ctrl_x) {
                     app.ctrl_x = false;
                     terminal.resize_by(step, 11)?;

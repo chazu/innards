@@ -29,6 +29,16 @@ pub enum ResizeStep {
     Shrink,
 }
 
+/// C-x 1 toggles an inline surface between its configured height and the full
+/// terminal. This matches the established C-x resize chord without consuming
+/// an ordinary editor or filter key.
+pub fn is_fullscreen_toggle_key(key: KeyEvent, after_ctrl_x: bool) -> bool {
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        && after_ctrl_x
+        && key.code == KeyCode::Char('1')
+        && key.modifiers.is_empty()
+}
+
 impl ResizeStep {
     /// C-x ^ / C-x - share the existing Alt-Down / Alt-Up resize behavior.
     /// Bare punctuation remains available to editors and filter inputs.
@@ -69,6 +79,7 @@ pub struct InlineTerminal {
     mouse_capture: bool,
     bracketed_paste: bool,
     area: Rect,
+    configured_height: u16,
     resize_prefix_pending: bool,
 }
 
@@ -95,6 +106,7 @@ impl InlineTerminal {
             mouse_capture: false,
             bracketed_paste: false,
             area: Rect::new(0, 0, 0, height.max(MIN_HEIGHT)),
+            configured_height: height.max(MIN_HEIGHT),
             resize_prefix_pending: false,
         })
     }
@@ -132,8 +144,14 @@ impl InlineTerminal {
             return Ok(false);
         }
         let step = ResizeStep::from_key(key, self.resize_prefix_pending);
+        let toggle_fullscreen = is_fullscreen_toggle_key(key, self.resize_prefix_pending);
         self.resize_prefix_pending =
             key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if toggle_fullscreen {
+            self.resize_prefix_pending = false;
+            self.toggle_full_height()?;
+            return Ok(true);
+        }
         if let Some(step) = step {
             self.resize_by(step, minimum)?;
             return Ok(true);
@@ -146,6 +164,26 @@ impl InlineTerminal {
         let height = step.height(self.area.height, minimum, rows);
         if height != self.area.height {
             let anchor_y = resize_anchor_row(self.area.y, self.area.height, height, rows);
+            self.resize(height, anchor_y)?;
+        }
+        Ok(())
+    }
+
+    /// Toggle between the initial configured height and every terminal row.
+    pub fn toggle_full_height(&mut self) -> Result<()> {
+        let rows = terminal_rows(self.area.height);
+        let full_height = self.area.height >= rows;
+        let height = if full_height {
+            self.configured_height.min(rows)
+        } else {
+            rows
+        };
+        let anchor_y = if full_height {
+            rows.saturating_sub(height)
+        } else {
+            0
+        };
+        if height != self.area.height || anchor_y != self.area.y {
             self.resize(height, anchor_y)?;
         }
         Ok(())
@@ -423,6 +461,20 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn fullscreen_toggle_requires_the_ctrl_x_prefix() {
+        let one = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
+        assert!(!is_fullscreen_toggle_key(one, false));
+        assert!(is_fullscreen_toggle_key(one, true));
+        assert!(is_fullscreen_toggle_key(
+            KeyEvent {
+                kind: KeyEventKind::Repeat,
+                ..one
+            },
+            true
+        ));
     }
 
     #[test]

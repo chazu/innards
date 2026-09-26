@@ -31,9 +31,11 @@ current prompt instead of taking over the whole screen.
 
 While any view is open, use **Ctrl-X, then ^** (`C-x ^`) to grow it by one
 terminal row, or **Ctrl-X, then -** (`C-x -`) to shrink it by one row.
-Alt-Down and Alt-Up are equivalent. Resizing stops at the view's minimum
-usable height and the terminal's full height; it preserves the current
-selection, search, and edits. The size applies to the currently open view.
+Use **Ctrl-X, then 1** (`C-x 1`) to toggle between the full terminal and the
+view's configured height. Alt-Down and Alt-Up are equivalent. Resizing stops
+at the view's minimum usable height and the terminal's full height; it
+preserves the current selection, search, and edits. The size applies to the
+currently open view.
 
 ## Build
 
@@ -242,6 +244,7 @@ Ctrl-X Ctrl-S     Save
 Ctrl-X Ctrl-C     Quit
 Ctrl-X ^          Grow the inline viewport by one row
 Ctrl-X -          Shrink the inline viewport by one row
+Ctrl-X 1          Toggle between the configured height and full terminal
 Ctrl-S            Incremental search forward
 Ctrl-R            Incremental search backward
 Ctrl-S/Ctrl-R     Repeat search while searching

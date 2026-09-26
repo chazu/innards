@@ -16,7 +16,9 @@ use syntect::parsing::{SyntaxDefinition, SyntaxReference, SyntaxSet};
 
 mod render;
 
-use crate::inline_terminal::{InlineTerminal, ResizeStep, termination_flag};
+use crate::inline_terminal::{
+    InlineTerminal, ResizeStep, is_fullscreen_toggle_key, termination_flag,
+};
 use crate::redraw::IDLE_POLL;
 
 const DEFAULT_HEIGHT: u16 = 16;
@@ -1359,6 +1361,13 @@ fn handle_key(
 ) -> Result<Option<Outcome>> {
     // Resize before search/edit handling so the chord changes only geometry.
     // Keep the editor's existing C-x save/quit state and dispatch intact.
+    if is_fullscreen_toggle_key(key, app.ctrl_x_pending) {
+        app.ctrl_x_pending = false;
+        terminal.toggle_full_height()?;
+        app.height = terminal.height();
+        app.status = "full height toggle".to_string();
+        return Ok(None);
+    }
     if let Some(step) = ResizeStep::from_key(key, app.ctrl_x_pending) {
         app.ctrl_x_pending = false;
         terminal.resize_by(step, MIN_HEIGHT)?;
