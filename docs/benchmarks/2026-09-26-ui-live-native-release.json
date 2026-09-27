@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "view": "events",
+  "counters": {
+    "bytes_in": 1555876,
+    "bytes_out": 135,
+    "cached_rows": 1,
+    "frames_in": 2,
+    "in_flight": 0,
+    "in_flight_peak": 1,
+    "plot_cache_misses": 2,
+    "queued_bytes_peak": 135,
+    "redraws": 6,
+    "requests_out": 1,
+    "retained_widgets": 7,
+    "rows_rendered": 65,
+    "text_cache_misses": 1,
+    "visible_rows": 1
+  },
+  "receipts": [
+    {
+      "request_id": 1,
+      "ack_us": null,
+      "rendered_update_us": 69851
+    }
+  ],
+  "sources": {
+    "events": 1
+  },
+  "timings": {
+    "buffer_render_including_layout": {
+      "count": 6,
+      "total_us": 2332,
+      "max_us": 1892,
+      "buckets": [
+        4,
+        1,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "draw_and_terminal_write": {
+      "count": 6,
+      "total_us": 5364,
+      "max_us": 3043,
+      "buckets": [
+        0,
+        3,
+        2,
+        1,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "layout": {
+      "count": 10,
+      "total_us": 107,
+      "max_us": 56,
+      "buckets": [
+        10,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "local_input_to_terminal_write": {
+      "count": 3,
+      "total_us": 1376,
+      "max_us": 845,
+      "buckets": [
+        0,
+        2,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "protocol_decode": {
+      "count": 2,
+      "total_us": 6934,
+      "max_us": 6853,
+      "buckets": [
+        1,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0
+      ]
+    },
+    "query_roundtrip": {
+      "count": 1,
+      "total_us": 60155,
+      "max_us": 60155,
+      "buckets": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0
+      ]
+    },
+    "reconcile": {
+      "count": 2,
+      "total_us": 5620,
+      "max_us": 3913,
+      "buckets": [
+        0,
+        0,
+        0,
+        2,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  }
+}

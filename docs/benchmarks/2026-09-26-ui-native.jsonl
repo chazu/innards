@@ -1,0 +1,2 @@
+{"input_and_test_buffer_us":{"max":345,"p50":107,"p95":116,"p99":171},"profile":false,"rows":10000,"samples":1000,"single_row_update_us":{"max":33,"p50":0,"p99":6}}
+{"input_and_test_buffer_us":{"max":287,"p50":107,"p95":112,"p99":167},"profile":true,"rows":10000,"samples":1000,"single_row_update_us":{"max":25,"p50":0,"p99":5}}

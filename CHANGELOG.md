@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Add `inui`, a retained terminal widget toolkit with native editing and focus,
+  virtualized lists/tables, local rules, asynchronous debounced queries, split
+  dragging and cached extrema-preserving plots. Its bounded JSONL protocol
+  validates atomic revisioned batches and retains drafts across failed/stale
+  acknowledgements. Disabled-by-default profiling spans protocol, reconciliation,
+  layout, rendering, terminal output and correlated request receipts.
+
+
 ## 2026-09-14
 
 - Applets no longer redraw on idle poll timeouts. Frames follow input, resize,

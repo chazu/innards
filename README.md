@@ -26,7 +26,10 @@ Quick, and get out of your way.
 - `inagent`: live agent conversation with backlog, a message composer, search,
   and explicit session-control intents over a duplex JSONL protocol.
 
-All seven use ratatui with an inline terminal viewport, so they open below the
+- `inui`: retained widgets, virtualized collections, native plots and controls,
+  and revisioned asynchronous JSONL updates.
+
+All eight use ratatui with an inline terminal viewport, so they open below the
 current prompt instead of taking over the whole screen.
 
 While any view is open, use **Ctrl-X, then ^** (`C-x ^`) to grow it by one
@@ -447,3 +450,27 @@ cargo build --bins
 ## License
 
 `navsplat` is licensed under GPL-3.0-only. See `LICENSE`.
+
+## inui
+
+`inui --height 20` hosts a retained widget tree over version-1 JSONL. Its widgets
+are panels, text, editable inputs, buttons, toggles, selects, virtualized lists
+and tables, draggable splits, glyph canvases and extrema-preserving plots.
+Keyboard editing, focus, cached navigation, split dragging and plot interaction
+stay native. Pipe I/O uses bounded reader/writer queues. Domain actions are
+explicit request IDs, never automatic retries after uncertain outcomes.
+
+For an executable caller, Trashtalk's `@ UI::Events open` supplies a synthetic
+10,000-event feed with asynchronous filtering, details and a plot.
+`UI::Inspector openRecord:title:` supplies a compositional horizontal inspection
+stack. Existing applets continue to use their own protocols.
+
+See [the protocol and controls](docs/inui.md). Run with
+`--profile /tmp/inui-profile.json` for native timing histograms and request
+receipts. F12 saves a current summary, F11 resets native counters, and exit saves
+it again. Profiling is disabled by default and never writes to protocol stdout.
+
+```sh
+cargo test --test ui_contract
+cargo test --release --lib ui::tests::performance_receipt -- --ignored --nocapture
+```
