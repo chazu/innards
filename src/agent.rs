@@ -9,7 +9,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
@@ -259,7 +259,7 @@ impl Draft {
 struct Row {
     id: String,
     text: String,
-    color: Color,
+    style: Style,
 }
 enum Overlay {
     Commands(usize),
@@ -437,20 +437,51 @@ impl App {
         let anchor = self.rows.get(self.scroll).map(|r| r.id.clone());
         self.width = width.max(1);
         self.rows.clear();
-        for entry in &self.entries {
-            let color = match entry.kind.as_str() {
+        for (entry_index, entry) in self.entries.iter().enumerate() {
+            let accent = match entry.kind.as_str() {
                 "message" | "question" => Color::Cyan,
                 "error" => Color::Red,
                 "tool" | "tool_input_delta" => Color::Yellow,
                 "reasoning" | "reasoning_delta" | "status" => Color::DarkGray,
                 _ => Color::White,
             };
-            let text = format!("{}\n{}\n", entry.title, entry.text);
-            for (i, line) in wrap(&text, self.width).into_iter().enumerate() {
+            let title_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+            let body_style = match entry.kind.as_str() {
+                "message" | "question" => Style::default().fg(Color::White),
+                "error" => Style::default().fg(Color::Red),
+                "tool" | "tool_input_delta" => Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+                "reasoning" | "reasoning_delta" | "status" => Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+                _ => Style::default().fg(Color::White),
+            };
+            self.rows.push(Row {
+                id: format!("{}/title", entry.id),
+                text: entry.title.clone(),
+                style: title_style,
+            });
+            let body_width = self.width.saturating_sub(2).max(1);
+            for (line_index, line) in wrap(&entry.text, body_width).into_iter().enumerate() {
+                let text = if line_index == 0 || self.width <= 2 {
+                    line
+                } else {
+                    format!("  {line}")
+                };
                 self.rows.push(Row {
-                    id: format!("{}/{i}", entry.id),
-                    text: line,
-                    color,
+                    id: format!("{}/body-{line_index}", entry.id),
+                    text,
+                    style: body_style,
+                });
+            }
+            if entry_index + 1 < self.entries.len() {
+                self.rows.push(Row {
+                    id: format!("{}/separator", entry.id),
+                    text: "─".repeat(self.width),
+                    style: Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
                 });
             }
         }
@@ -868,7 +899,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             .iter()
             .skip(app.scroll)
             .take(app.page)
-            .map(|r| Line::styled(r.text.clone(), Style::default().fg(r.color)))
+            .map(|r| Line::styled(r.text.clone(), r.style))
             .collect()
     };
     frame.render_widget(
@@ -1057,6 +1088,35 @@ mod tests {
         (1..buffer.area.width - 1)
             .map(|x| buffer[(x, y)].symbol())
             .collect()
+    }
+    #[test]
+    fn transcript_rows_separate_metadata_content_and_turns() {
+        let mut app = App::default();
+        app.apply(snapshot(vec![
+            json!({"id":"message","kind":"message","title":"You","text":"123456789"}),
+            json!({"id":"tool","kind":"tool","title":"Read file","text":"src/agent.rs"}),
+        ]))
+        .unwrap();
+        app.rebuild(10);
+
+        assert_eq!(app.rows[0].id, "message/title");
+        assert_eq!(app.rows[0].text, "You");
+        assert_eq!(
+            app.rows[0].style,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(app.rows[1].text, "12345678");
+        assert_eq!(app.rows[2].text, "  9");
+        assert_eq!(app.rows[3].text, "─".repeat(10));
+        assert_eq!(app.rows[4].text, "Read file");
+        assert_eq!(
+            app.rows[5].style,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM)
+        );
     }
     #[test]
     fn composer_wraps_and_reflows_without_changing_the_message() {
