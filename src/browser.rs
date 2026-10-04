@@ -35,7 +35,7 @@ pub struct Method {
     pub raw: bool,
     pub line: usize,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pane {
     Packages,
     Classes,
@@ -188,7 +188,7 @@ impl App {
     fn key(&mut self, k: KeyCode) -> bool {
         match k {
             KeyCode::Char('q') | KeyCode::Esc => return true,
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::Char('h') => {
                 self.pane = match self.pane {
                     Pane::Packages => Pane::Packages,
                     Pane::Classes => Pane::Packages,
@@ -196,7 +196,7 @@ impl App {
                     Pane::Methods => Pane::Protocols,
                 }
             }
-            KeyCode::Right | KeyCode::Enter => {
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
                 self.pane = match self.pane {
                     Pane::Packages => Pane::Classes,
                     Pane::Classes => Pane::Protocols,
@@ -213,6 +213,71 @@ impl App {
         false
     }
 }
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(Index {
+            schema_version: 1,
+            root: "/unused".into(),
+            classes: vec![],
+        })
+    }
+
+    #[test]
+    fn horizontal_letters_match_arrows_in_every_pane() {
+        for pane in [
+            Pane::Packages,
+            Pane::Classes,
+            Pane::Protocols,
+            Pane::Methods,
+        ] {
+            for (letter, arrow) in [('h', KeyCode::Left), ('l', KeyCode::Right)] {
+                let mut letters = app();
+                let mut arrows = app();
+                letters.pane = pane;
+                arrows.pane = pane;
+                assert!(!letters.key(KeyCode::Char(letter)));
+                assert!(!arrows.key(arrow));
+                assert_eq!(letters.pane, arrows.pane);
+            }
+        }
+    }
+
+    #[test]
+    fn horizontal_focus_clamps_at_edges() {
+        let mut browser = app();
+        browser.key(KeyCode::Char('h'));
+        assert_eq!(browser.pane, Pane::Packages);
+        for _ in 0..4 {
+            browser.key(KeyCode::Char('l'));
+        }
+        assert_eq!(browser.pane, Pane::Methods);
+    }
+
+    #[test]
+    fn vertical_letters_still_select_without_changing_focus() {
+        let mut browser = app();
+        browser.index.classes = ["Alpha", "Beta"]
+            .into_iter()
+            .map(|name| Class {
+                name: name.into(),
+                package: name.into(),
+                kind: "class".into(),
+                superclass: "Object".into(),
+                path: "/unused".into(),
+                methods: vec![],
+            })
+            .collect();
+        browser.key(KeyCode::Char('j'));
+        assert_eq!(browser.package, 1);
+        browser.key(KeyCode::Char('k'));
+        assert_eq!(browser.package, 0);
+        assert_eq!(browser.pane, Pane::Packages);
+    }
+}
+
 fn list<'a>(
     title: &'a str,
     rows: Vec<String>,
@@ -265,7 +330,7 @@ fn draw(f: &mut Frame, a: &App) {
     let cs = a.classes();
     let ps = a.protocols();
     let ms = a.methods();
-    f.render_widget(Paragraph::new("Trashtalk Browser · ↑/↓ select · ←/→ pane · Enter drill in · PgUp/PgDn source · q close").block(Block::default().borders(Borders::ALL).title(" Read-only ")),areas[0]);
+    f.render_widget(Paragraph::new("Trashtalk Browser · ↑/↓ or j/k select · ←/→ or h/l pane · Enter drill in · PgUp/PgDn source · q close").block(Block::default().borders(Borders::ALL).title(" Read-only ")),areas[0]);
     f.render_widget(
         list(
             "Packages",
