@@ -38,6 +38,41 @@ fn draw(app: &mut App) -> String {
         .map(|c| c.symbol())
         .collect()
 }
+fn tree_and_tabs() -> Frame {
+    frame(
+        json!({"schema_version":1,"view":"widgets","type":"init","revision":0,
+        "root":{"kind":"panel","key":"root","props":{"direction":"column"},"children":[
+            {"kind":"tree","key":"tree","props":{"border":true,"tree":[
+                {"key":"project","label":"Project","expanded":true,"children":[
+                    {"key":"readme","label":"README","children":[]}
+                ]},
+                {"key":"notes","label":"Notes","children":[]}
+            ]}},
+            {"kind":"tabs","key":"tabs","props":{"border":true,"options":["Overview","Files","History"]}}
+        ]},"collections":[]}),
+    )
+}
+#[test]
+fn tree_and_tabs_keep_navigation_local_and_render_selected_state() {
+    let mut app = App::new(false);
+    app.apply(tree_and_tabs()).unwrap();
+    draw(&mut app);
+    assert_eq!(app.focus, "tree");
+    key(&mut app, KeyCode::Down);
+    assert_eq!(app.local["tree"].selected_key.as_deref(), Some("readme"));
+    key(&mut app, KeyCode::Char('h'));
+    assert!(!app.local["tree"].expanded.contains("readme"));
+    key(&mut app, KeyCode::Up);
+    key(&mut app, KeyCode::Char('h'));
+    let rendered = draw(&mut app);
+    assert!(!rendered.contains("README"));
+    key(&mut app, KeyCode::Tab);
+    assert_eq!(app.focus, "tabs");
+    key(&mut app, KeyCode::Char('l'));
+    assert_eq!(app.local["tabs"].selected_key.as_deref(), Some("Files"));
+    assert!(draw(&mut app).contains("[Files]"));
+    assert!(app.take_intent().is_none());
+}
 #[test]
 fn local_navigation_10k_rows_emits_no_model_calls() {
     let mut app = App::new(true);

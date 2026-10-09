@@ -22,6 +22,8 @@ pub struct Local {
     pub offset: usize,
     pub following: bool,
     pub unread: usize,
+    pub expanded: HashSet<String>,
+    pub tree_initialized: bool,
 }
 struct Pending {
     intent: IntentKind,
@@ -90,6 +92,7 @@ fn prepare_tree(mut root: Node) -> Result<PreparedTree> {
         );
         ensure!(
             node.props.options.len() <= 128
+                && node.props.tree.len() <= 128
                 && node.props.columns.len() <= 32
                 && node.props.inputs.len() <= 64
                 && node.props.cells.len() <= 4096,
@@ -125,6 +128,8 @@ fn prepare_tree(mut root: Node) -> Result<PreparedTree> {
                     | Kind::Select
                     | Kind::Split
                     | Kind::Plot
+                    | Kind::Tree
+                    | Kind::Tabs
             )
         {
             focus.push(node.key.clone());
@@ -206,6 +211,18 @@ impl App {
                 following: p.follow_end,
                 ..Local::default()
             });
+            if *kind == Kind::Tree && !state.tree_initialized {
+                fn defaults(nodes: &[TreeNode], expanded: &mut HashSet<String>) {
+                    for node in nodes {
+                        if node.expanded {
+                            expanded.insert(node.key.clone());
+                        }
+                        defaults(&node.children, expanded);
+                    }
+                }
+                defaults(&p.tree, &mut state.expanded);
+                state.tree_initialized = true;
+            }
             if matches!(kind, Kind::Input | Kind::Toggle | Kind::Select) && !state.edited {
                 state.draft = p.value.clone();
                 state.cursor = state.cursor.min(state.draft.len());
@@ -902,6 +919,91 @@ impl App {
                     if target >= state.offset + height {
                         state.offset = target.saturating_sub(height.saturating_sub(1));
                     }
+                }
+            }
+            Kind::Tree => {
+                fn visible(nodes: &[TreeNode], expanded: &HashSet<String>, out: &mut Vec<String>) {
+                    for node in nodes {
+                        out.push(node.key.clone());
+                        if expanded.contains(&node.key) {
+                            visible(&node.children, expanded, out);
+                        }
+                    }
+                }
+                let state = self.local.get_mut(&focus).unwrap();
+                let mut rows = Vec::new();
+                visible(&p.tree, &state.expanded, &mut rows);
+                if rows.is_empty() {
+                    return true;
+                }
+                state.selected = state.selected.min(rows.len() - 1);
+                let selected = rows[state.selected].clone();
+                let has_children = |nodes: &[TreeNode], key: &str| -> bool {
+                    fn find(nodes: &[TreeNode], key: &str) -> Option<bool> {
+                        for node in nodes {
+                            if node.key == key {
+                                return Some(!node.children.is_empty());
+                            }
+                            if let Some(found) = find(&node.children, key) {
+                                return Some(found);
+                            }
+                        }
+                        None
+                    }
+                    find(nodes, key).unwrap_or(false)
+                };
+                let should_activate =
+                    key.code == KeyCode::Enter && !has_children(&p.tree, &selected);
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        state.selected = (state.selected + 1).min(rows.len() - 1)
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.selected = state.selected.saturating_sub(1)
+                    }
+                    KeyCode::Home => state.selected = 0,
+                    KeyCode::End => state.selected = rows.len() - 1,
+                    KeyCode::Right | KeyCode::Char('l') if has_children(&p.tree, &selected) => {
+                        state.expanded.insert(selected);
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        state.expanded.remove(&selected);
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') if has_children(&p.tree, &selected) => {
+                        if !state.expanded.remove(&selected) {
+                            state.expanded.insert(selected);
+                        }
+                    }
+                    _ => {}
+                }
+                state.selected_key = rows.get(state.selected).cloned();
+                let _ = state;
+                if should_activate {
+                    self.activate(&focus);
+                }
+            }
+            Kind::Tabs => {
+                if p.options.is_empty() {
+                    return true;
+                }
+                let state = self.local.get_mut(&focus).unwrap();
+                let count = p.options.len();
+                let should_activate = key.code == KeyCode::Enter;
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        state.selected = (state.selected + count - 1) % count
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        state.selected = (state.selected + 1) % count
+                    }
+                    KeyCode::Home => state.selected = 0,
+                    KeyCode::End => state.selected = count - 1,
+                    _ => {}
+                }
+                state.selected_key = p.options.get(state.selected).cloned();
+                let _ = state;
+                if should_activate {
+                    self.activate(&focus);
                 }
             }
             Kind::Toggle if key.code == KeyCode::Enter || key.code == KeyCode::Char(' ') => {

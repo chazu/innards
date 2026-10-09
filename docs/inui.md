@@ -55,7 +55,7 @@ frame := @ UI::Surface view: 'example' revision: '0' root: root collections: '[]
 
 `UI::Node kind:key:props:children:` exposes all resolved native properties.
 The primitives are `panel`, `text`, `input`, `button`, `toggle`, `select`,
-`list`, `table`, `split`, `canvas`, and `plot`. Common properties include `title`,
+`list`, `table`, `tree`, `tabs`, `split`, `canvas`, and `plot`. Common properties include `title`,
 `border`, `padding`, `gap`, `size` (fixed cells; zero shares available space),
 `hidden`, `disabled`, `focused` (a new/changed focus request), and `style` (`primary`, `error`, or default).
 Panels use `direction: 'row'` or `'column'`. `min_parent_width` hides a child
@@ -81,6 +81,17 @@ explicitly replace an editing session. A keyed node preserves local state on
 reordering; a type change replaces it. Unkeyed nodes use parent/position identity.
 The implementation has basic terminal styling and text editing, not a general
 CSS system, full editor command set, or automatic system clipboard integration.
+
+`tree` takes a `tree` property containing nodes shaped as
+`{key,label,expanded,children}`. Each node key must be stable within that tree.
+The native surface retains selection and expanded branches. Use Up/Down or j/k
+to select, Right/l to expand, Left/h to collapse, and Space to toggle a branch.
+Enter invokes the optional action for the selected tree widget.
+
+`tabs` takes an `options` array of labels. The native surface retains the
+selected index. Use Left/h and Right/l to select a tab, Home/End to jump, and
+Enter to invoke the optional action. Tree and Tabs selection is local and an
+action receives no value until a later protocol version adds a selected value.
 
 ## Signals and ordinary blocks
 

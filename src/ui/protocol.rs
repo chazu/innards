@@ -24,6 +24,10 @@ pub enum Kind {
     Split,
     Canvas,
     Plot,
+    /// Hierarchical local navigation backed by `tree`.
+    Tree,
+    /// A tab strip backed by `options`; selected state is local.
+    Tabs,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -35,6 +39,8 @@ pub struct Props {
     pub forward_action: String,
     pub columns: Vec<String>,
     pub options: Vec<String>,
+    /// Hierarchical nodes for a Tree widget.
+    pub tree: Vec<TreeNode>,
     pub inputs: Vec<String>,
     pub cells: Vec<Glyph>,
     pub x_field: String,
@@ -66,6 +72,18 @@ pub struct Props {
     pub clear_on_ack: bool,
     pub style: String,
     pub accessibility_label: String,
+}
+
+/// A stable Tree node. A Tree keeps selection and expansion by this key.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TreeNode {
+    pub key: String,
+    pub label: String,
+    #[serde(default)]
+    pub expanded: bool,
+    #[serde(default)]
+    pub children: Vec<TreeNode>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

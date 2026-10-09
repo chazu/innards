@@ -111,6 +111,8 @@ impl Renderer {
                     | Kind::Select
                     | Kind::Split
                     | Kind::Plot
+                    | Kind::Tree
+                    | Kind::Tabs
             )
         {
             self.focus.push(node.key.clone());
@@ -262,6 +264,71 @@ impl Renderer {
                     Paragraph::new(format!("‹ {} ›", state.draft)).style(style),
                     inner,
                 );
+            }
+            Kind::Tabs => {
+                let state = &app.local[&node.key];
+                let tabs = p
+                    .options
+                    .iter()
+                    .enumerate()
+                    .map(|(index, label)| {
+                        if index == state.selected {
+                            format!("[{}]", label)
+                        } else {
+                            format!(" {} ", label)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                frame.render_widget(
+                    Paragraph::new(tabs).style(if focused {
+                        style.add_modifier(Modifier::BOLD)
+                    } else {
+                        style
+                    }),
+                    inner,
+                );
+            }
+            Kind::Tree => {
+                fn rows(
+                    nodes: &[super::protocol::TreeNode],
+                    expanded: &std::collections::HashSet<String>,
+                    depth: usize,
+                    out: &mut Vec<(String, String)>,
+                ) {
+                    for node in nodes {
+                        let marker = if node.children.is_empty() {
+                            " "
+                        } else if expanded.contains(&node.key) {
+                            "▾"
+                        } else {
+                            "▸"
+                        };
+                        out.push((
+                            node.key.clone(),
+                            format!("{}{} {}", "  ".repeat(depth), marker, node.label),
+                        ));
+                        if expanded.contains(&node.key) {
+                            rows(&node.children, expanded, depth + 1, out);
+                        }
+                    }
+                }
+                let state = &app.local[&node.key];
+                let mut tree_rows = Vec::new();
+                rows(&p.tree, &state.expanded, 0, &mut tree_rows);
+                let lines = tree_rows
+                    .iter()
+                    .enumerate()
+                    .take(inner.height as usize)
+                    .map(|(index, (_, label))| {
+                        Line::from(label.as_str()).style(if index == state.selected {
+                            style.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                        } else {
+                            style
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                frame.render_widget(Paragraph::new(lines), inner);
             }
             Kind::Split => {
                 let state = &app.local[&node.key];
