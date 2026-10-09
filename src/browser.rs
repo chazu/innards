@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 use serde::Deserialize;
 
@@ -330,7 +330,7 @@ fn draw(f: &mut Frame, a: &App) {
     let cs = a.classes();
     let ps = a.protocols();
     let ms = a.methods();
-    f.render_widget(Paragraph::new("Trashtalk Browser · ↑/↓ or j/k select · ←/→ or h/l pane · Enter drill in · PgUp/PgDn source · q close").block(Block::default().borders(Borders::ALL).title(" Read-only ")),areas[0]);
+    f.render_widget(Paragraph::new("Trashtalk Browser · ↑/↓ or j/k select · ←/→ or h/l pane · Enter drill in · PgUp/PgDn source · source wraps · q close").block(Block::default().borders(Borders::ALL).title(" Read-only ")),areas[0]);
     f.render_widget(
         list(
             "Packages",
@@ -389,7 +389,9 @@ fn draw(f: &mut Frame, a: &App) {
         .map(|(i, x)| Line::raw(format!("{:4}  {x}", i + a.source_scroll + 1)))
         .collect();
     f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Source ")),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" Source ")),
         areas[2],
     );
 }
