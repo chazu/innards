@@ -27,7 +27,10 @@ fn key(app: &mut App, key: KeyCode) {
     app.key(KeyEvent::new(key, KeyModifiers::NONE));
 }
 fn draw(app: &mut App) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(100, 22)).unwrap();
+    draw_at(app, 100, 22)
+}
+fn draw_at(app: &mut App, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     let mut renderer = Renderer::default();
     terminal.draw(|frame| renderer.draw(app, frame)).unwrap();
     terminal
@@ -65,6 +68,8 @@ fn tree_and_tabs_keep_navigation_local_and_render_selected_state() {
     key(&mut app, KeyCode::Up);
     key(&mut app, KeyCode::Char('h'));
     let rendered = draw(&mut app);
+    assert_eq!(app.local["tree"].selected_key.as_deref(), Some("project"));
+    assert!(rendered.contains("Project"));
     assert!(!rendered.contains("README"));
     key(&mut app, KeyCode::Tab);
     assert_eq!(app.focus, "tabs");
@@ -72,6 +77,33 @@ fn tree_and_tabs_keep_navigation_local_and_render_selected_state() {
     assert_eq!(app.local["tabs"].selected_key.as_deref(), Some("Files"));
     assert!(draw(&mut app).contains("[Files]"));
     assert!(app.take_intent().is_none());
+}
+#[test]
+fn tree_navigation_scrolls_the_local_viewport_to_keep_selection_visible() {
+    let nodes = (0..12)
+        .map(|index| json!({"key":format!("node-{index}"),"label":format!("Node {index}"),"children":[]}))
+        .collect::<Vec<_>>();
+    let mut app = App::new(false);
+    app.apply(frame(
+        json!({"schema_version":1,"view":"tree-scroll","type":"init","revision":0,
+        "root":{"kind":"tree","key":"tree","props":{"border":true,"tree":nodes}},"collections":[]}),
+    ))
+    .unwrap();
+    draw_at(&mut app, 40, 6);
+    for _ in 0..10 {
+        key(&mut app, KeyCode::Char('j'));
+    }
+    let rendered = draw_at(&mut app, 40, 6);
+    assert_eq!(app.local["tree"].selected_key.as_deref(), Some("node-10"));
+    assert!(app.local["tree"].offset > 0);
+    assert!(rendered.contains("Node 10"));
+    assert!(!rendered.contains("Node 0"));
+    for _ in 0..10 {
+        key(&mut app, KeyCode::Char('k'));
+    }
+    let rendered = draw_at(&mut app, 40, 6);
+    assert_eq!(app.local["tree"].offset, 0);
+    assert!(rendered.contains("Node 0"));
 }
 #[test]
 fn bundled_tree_and_tabs_example_is_a_renderable_v1_frame() {

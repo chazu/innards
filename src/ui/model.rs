@@ -930,6 +930,7 @@ impl App {
                         }
                     }
                 }
+                let height = *self.visible.get(&focus).unwrap_or(&10);
                 let state = self.local.get_mut(&focus).unwrap();
                 let mut rows = Vec::new();
                 visible(&p.tree, &state.expanded, &mut rows);
@@ -977,6 +978,12 @@ impl App {
                     _ => {}
                 }
                 state.selected_key = rows.get(state.selected).cloned();
+                if state.selected < state.offset {
+                    state.offset = state.selected;
+                }
+                if state.selected >= state.offset + height {
+                    state.offset = state.selected.saturating_sub(height.saturating_sub(1));
+                }
                 let _ = state;
                 if should_activate {
                     self.activate(&focus);

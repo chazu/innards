@@ -316,9 +316,22 @@ impl Renderer {
                 let state = &app.local[&node.key];
                 let mut tree_rows = Vec::new();
                 rows(&p.tree, &state.expanded, 0, &mut tree_rows);
+                let height = inner.height as usize;
+                app.visible.insert(node.key.clone(), height);
+                let state = app.local.get_mut(&node.key).unwrap();
+                state.selected = state.selected.min(tree_rows.len().saturating_sub(1));
+                state.offset = state.offset.min(tree_rows.len().saturating_sub(height));
+                if state.selected < state.offset {
+                    state.offset = state.selected;
+                }
+                if state.selected >= state.offset + height {
+                    state.offset = state.selected.saturating_sub(height.saturating_sub(1));
+                }
+                state.selected_key = tree_rows.get(state.selected).map(|(key, _)| key.clone());
                 let lines = tree_rows
                     .iter()
                     .enumerate()
+                    .skip(state.offset)
                     .take(inner.height as usize)
                     .map(|(index, (_, label))| {
                         Line::from(label.as_str()).style(if index == state.selected {
