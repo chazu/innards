@@ -25,6 +25,19 @@ debounced filtering, and a small plot. Its events are not agent transcripts or
 production telemetry. Existing `inagent` and `ininspect` flows remain available.
 Applications connect their own bulk sources through the handler contract below.
 
+## Tree and Tabs example
+
+From the Innards checkout, run the bundled version-1 JSONL example:
+
+```bash
+cat examples/tree-tabs.jsonl | cargo run --bin inui -- --height 18
+```
+
+The terminal surface uses `/dev/tty`, so the pipe remains the protocol input.
+Use j/k to select a Tree node, h/l to collapse or expand it, Space to toggle a
+branch, then Tab to focus Tabs and h/l to change the selected tab. Press Esc or
+Ctrl-C to exit.
+
 Tab/Shift-Tab move focus; arrows, Home/End and PageUp/PageDown navigate lists and
 tables. Enter invokes an action or submits a single-line input. Multiline input
 uses Enter for newline and Ctrl-Enter for submit where the terminal supports

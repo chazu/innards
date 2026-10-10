@@ -74,6 +74,17 @@ fn tree_and_tabs_keep_navigation_local_and_render_selected_state() {
     assert!(app.take_intent().is_none());
 }
 #[test]
+fn bundled_tree_and_tabs_example_is_a_renderable_v1_frame() {
+    let mut app = App::new(false);
+    for line in include_str!("../../examples/tree-tabs.jsonl").lines() {
+        app.apply(serde_json::from_str(line).unwrap()).unwrap();
+    }
+    let rendered = draw(&mut app);
+    assert!(rendered.contains("main.rs"));
+    assert!(rendered.contains("[Overview]"));
+    assert_eq!(app.focus, "workspace");
+}
+#[test]
 fn local_navigation_10k_rows_emits_no_model_calls() {
     let mut app = App::new(true);
     app.apply(init(10000, false)).unwrap();
