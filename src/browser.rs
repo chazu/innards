@@ -25,6 +25,10 @@ pub struct Class {
     pub superclass: String,
     pub path: String,
     #[serde(default)]
+    pub brief: String,
+    #[serde(default)]
+    pub help: String,
+    #[serde(default)]
     pub methods: Vec<Method>,
 }
 #[derive(Debug, Clone, Deserialize)]
@@ -34,6 +38,8 @@ pub struct Method {
     pub kind: String,
     pub raw: bool,
     pub line: usize,
+    #[serde(default)]
+    pub brief: String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pane {
@@ -161,7 +167,18 @@ impl App {
             .map(|x| x.line.saturating_sub(1))
             .min()
             .unwrap_or(lines.len());
-        lines.get(start..end).unwrap_or(&[]).join("\n")
+        let source = lines.get(start..end).unwrap_or(&[]).join("\n");
+        let mut documentation = String::new();
+        if !c.brief.is_empty() {
+            documentation.push_str(&format!("{}\n\n", c.brief));
+        }
+        if !m.brief.is_empty() {
+            documentation.push_str(&format!("{}\n\n", m.brief));
+        }
+        if !c.help.is_empty() {
+            documentation.push_str(&format!("{}\n\n", c.help));
+        }
+        format!("{documentation}{source}")
     }
     fn move_by(&mut self, delta: isize) {
         let n = match self.pane {
@@ -349,7 +366,11 @@ fn draw(f: &mut Frame, a: &App) {
                     format!(
                         "{} {}",
                         if x.superclass.is_empty() { "" } else { "↳" },
-                        x.name
+                        if x.brief.is_empty() {
+                            x.name.clone()
+                        } else {
+                            format!("{} · {}", x.name, x.brief)
+                        }
                     )
                 })
                 .collect(),
@@ -373,7 +394,18 @@ fn draw(f: &mut Frame, a: &App) {
         list(
             "Methods",
             ms.iter()
-                .map(|x| format!("{}{}", if x.raw { "raw " } else { "" }, x.selector))
+                .map(|x| {
+                    format!(
+                        "{}{}{}",
+                        if x.raw { "raw " } else { "" },
+                        x.selector,
+                        if x.brief.is_empty() {
+                            "".into()
+                        } else {
+                            format!(" · {}", x.brief)
+                        }
+                    )
+                })
                 .collect(),
             a.method,
             matches!(a.pane, Pane::Methods),
