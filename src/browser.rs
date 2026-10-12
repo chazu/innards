@@ -284,6 +284,8 @@ mod navigation_tests {
                 kind: "class".into(),
                 superclass: "Object".into(),
                 path: "/unused".into(),
+                brief: String::new(),
+                help: String::new(),
                 methods: vec![],
             })
             .collect();
@@ -292,6 +294,62 @@ mod navigation_tests {
         browser.key(KeyCode::Char('k'));
         assert_eq!(browser.package, 0);
         assert_eq!(browser.pane, Pane::Packages);
+    }
+
+    #[test]
+    fn index_accepts_absent_documentation_fields() {
+        let index = parse(
+            r#"{
+                "schema_version": 1,
+                "root": "/tmp",
+                "classes": [{
+                    "name": "Counter", "package": "", "kind": "class",
+                    "superclass": "Object", "path": "/tmp/Counter.trash",
+                    "methods": [{"selector": "count", "side": "instance",
+                        "kind": "instance_method", "raw": false, "line": 1}]
+                }]
+            }"#,
+        )
+        .expect("old indexes remain valid");
+        assert!(index.classes[0].brief.is_empty());
+        assert!(index.classes[0].help.is_empty());
+        assert!(index.classes[0].methods[0].brief.is_empty());
+    }
+
+    #[test]
+    fn source_includes_present_documentation() {
+        let root =
+            std::env::temp_dir().join(format!("innards-browser-docs-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create temporary source root");
+        let path = root.join("Counter.trash");
+        std::fs::write(&path, "Counter subclass: Object\n  method: count [ ^ 0 ]\n")
+            .expect("write temporary source");
+        let app = App::new(Index {
+            schema_version: 1,
+            root: root.display().to_string(),
+            classes: vec![Class {
+                name: "Counter".into(),
+                package: String::new(),
+                kind: "class".into(),
+                superclass: "Object".into(),
+                path: path.display().to_string(),
+                brief: "Counts stored values.".into(),
+                help: "Open the class, then select count.".into(),
+                methods: vec![Method {
+                    selector: "count".into(),
+                    side: "instance".into(),
+                    kind: "instance_method".into(),
+                    raw: false,
+                    line: 2,
+                    brief: "Returns the number of values.".into(),
+                }],
+            }],
+        });
+        assert_eq!(
+            app.source(),
+            "Counts stored values.\n\nReturns the number of values.\n\nOpen the class, then select count.\n\n  method: count [ ^ 0 ]"
+        );
+        std::fs::remove_dir_all(root).expect("remove temporary source root");
     }
 }
 
