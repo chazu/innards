@@ -740,11 +740,19 @@ fn preview_lines(
                     format!("{line_number:>5} "),
                     Style::default().fg(Color::DarkGray),
                 ),
-                Span::styled(text.clone(), style),
+                Span::styled(display_text(text), style),
             ])
         })
         .collect();
     (lines, true)
+}
+
+// Preview documents can be built from inbox bodies. Do not pass terminal
+// controls through to Ratatui even though their stored source remains intact.
+fn display_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
 }
 
 #[cfg(test)]
@@ -868,6 +876,11 @@ mod tests {
         assert!(!row(4).contains("message_123.txt"));
         assert!(row(9).contains("Message"));
         assert!(!row(9).contains("message_123.txt"));
+    }
+
+    #[test]
+    fn message_preview_text_replaces_terminal_controls() {
+        assert_eq!(display_text("prose\x1b[31m日本語\r"), "prose [31m日本語 ");
     }
 
     #[test]
@@ -1100,5 +1113,37 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(screen.contains("Pod subclass: Object"));
+    }
+
+    #[test]
+    fn message_preview_wraps_prose_and_unbroken_text_without_controls() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let scratch = ScratchDir::new("message-preview-wrap");
+        let source = scratch.join("message.txt");
+        std::fs::write(
+            &source,
+            "ordinary message prose\nlongunbrokenmessage日本語\x1b[31m",
+        )
+        .unwrap();
+        let mut item = candidate("message", "Message");
+        item.path = source;
+        let provider = StaticProvider::new(vec![item]);
+        let mut app = App::new(&provider, Config::new("."));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(frame, &mut app);
+            })
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("ordinary"));
+        assert!(screen.contains("longunbroken"));
+        assert!(!screen.contains('\x1b'));
     }
 }

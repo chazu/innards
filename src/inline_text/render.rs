@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use syntect::easy::HighlightLines;
 
 use super::{AnnotationSeverity, Editor, Mode, SyntaxHighlighter, line_selection_range, line_text};
@@ -34,8 +34,14 @@ pub(super) fn draw(
     let text_height = text_area.height.max(1) as usize;
     app.ensure_cursor_visible(text_height, text_width);
 
-    let lines = render_lines(app, syntax, text_height, text_width, prefix_width);
-    frame.render_widget(Paragraph::new(lines), text_area);
+    let lines = render_lines(app, syntax, text_height, text_width, prefix_width, mode);
+    let text = Paragraph::new(lines);
+    let text = if mode == Mode::View {
+        text.wrap(Wrap { trim: false })
+    } else {
+        text
+    };
+    frame.render_widget(text, text_area);
 
     let dirty = if app.dirty { " *" } else { "" };
     let status_text = app
@@ -75,6 +81,7 @@ fn render_lines(
     text_height: usize,
     text_width: usize,
     prefix_width: usize,
+    mode: Mode,
 ) -> Vec<Line<'static>> {
     let mut highlighter = HighlightLines::new(syntax.syntax(), &syntax.theme);
     let end = (app.scroll_y + text_height).min(app.line_count());
@@ -82,7 +89,7 @@ fn render_lines(
     let active_region = app.active_region();
 
     for idx in app.scroll_y..end {
-        let line = line_text(&app.buffer, idx);
+        let line = display_text(&line_text(&app.buffer, idx));
         let line_region = line_selection_range(app, idx, active_region.as_ref());
         let annotation = app.annotation_for_line(idx);
         let highlighted = highlighter
@@ -102,7 +109,11 @@ fn render_lines(
         spans.extend(slice_highlighted_line(
             highlighted,
             app.scroll_x,
-            text_width,
+            if mode == Mode::View {
+                usize::MAX
+            } else {
+                text_width
+            },
             line_region,
         ));
         if let Some(annotation) = annotation {
@@ -126,6 +137,58 @@ fn render_lines(
     }
 
     output
+}
+
+// View content can include untrusted inbox text. Keep printable Unicode and
+// replace all terminal controls before Ratatui receives the spans.
+fn display_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inline_text::{Config, Editor, SyntaxHighlighter};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn pager_display_text_keeps_unicode_and_removes_terminal_controls() {
+        assert_eq!(
+            display_text("ordinary 日本語\x1b[31m\t"),
+            "ordinary 日本語 [31m "
+        );
+    }
+
+    #[test]
+    fn pager_wraps_message_prose_and_unbroken_text_at_the_current_width() {
+        let path = std::env::temp_dir().join(format!("innards-inpage-wrap-{}", std::process::id()));
+        std::fs::write(
+            &path,
+            "ordinary message prose\nlongunbrokenmessage日本語\x1b[31m",
+        )
+        .unwrap();
+        let config = Config::for_path(Mode::View, &path);
+        let mut editor = Editor::open(&config).unwrap();
+        let syntax = SyntaxHighlighter::new(None, Some(&path)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(20, 12)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut editor, &syntax, Mode::View))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("ordinary"));
+        assert!(screen.contains("prose"));
+        assert!(screen.contains("longunbroken"));
+        assert!(!screen.contains('\x1b'));
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 fn severity_label(severity: &AnnotationSeverity) -> &'static str {

@@ -1119,6 +1119,23 @@ mod tests {
         );
     }
     #[test]
+    fn transcript_wraps_prose_and_unbroken_unicode_without_controls() {
+        let rows = wrap("ordinary prose wraps cleanly\n日本語abcdef\x1b[31m", 8);
+        assert_eq!(
+            rows,
+            [
+                "ordinary",
+                " prose w",
+                "raps cle",
+                "anly",
+                "日本語ab",
+                "cdef [31",
+                "m"
+            ]
+        );
+        assert!(rows.iter().all(|row| !row.contains('\x1b')));
+    }
+    #[test]
     fn composer_wraps_and_reflows_without_changing_the_message() {
         let mut app = App::default();
         app.apply(snapshot(vec![])).unwrap();
